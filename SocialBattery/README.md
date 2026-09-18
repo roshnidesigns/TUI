@@ -58,9 +58,9 @@ and the web preview greys out any arm that has no motor behind it yet.
 WiFi module. A servo on one of them appears to work right up until something switches the
 radio on.
 
-**D1 is also the board's Serial1 TX pin.** This sketch never uses Serial1, so driving a
-servo from D1 is safe here — just keep that in mind if you ever add something that talks
-over Serial1 (a GPS module, a second board, etc.), since it would conflict.
+**D1 is a plain digital pin** on the MKR (PA23, PWM and timer capable). Serial1 lives on
+D13/D14, so there is no UART conflict — D1 is free for a servo, a NeoPixel strip, or
+anything else.
 
 The SAMD `Servo` library drives any digital pin from a hardware timer rather than from
 `analogWrite`, so the plain digital pins used here — D1, D3 and D5 — all work.

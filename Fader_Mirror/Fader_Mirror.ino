@@ -68,7 +68,7 @@
 //     high     pixels 1..8           the whole strip
 //
 // Numbering below is 0-based, so your 1..8 become 0..7.
-#define LED_PIN 2
+#define LED_PIN 1
 #define LED_COUNT 8
 #define LED_BRIGHTNESS 90
 
@@ -132,6 +132,7 @@ int driveSpeed(int gap, int full) {
 #define GRAB_MARGIN 45      // legacy gap test, kept as a slower backstop
 #define SETTLE_MOVE 8      // Counts of change that still count as "hand moving"
 #define SETTLE_MS 400      // Hand still this long = you let go
+#define CAPTURE_MS 3000    // Longest we keep watching a gesture before acting on it
 
 // Function Declarations
 void motorCoast();
@@ -159,6 +160,9 @@ unsigned long stallTime = 0;
 int boost = 0;           // Extra duty added to break friction when stuck
 int boostReported = 0;   // Highest boost we have mentioned, so it is logged once
 int settleRef = 0;   // Reading the settle timer is measured against
+int handMin = 0;     // How far the hand travelled, while it was on the fader
+int handMax = 0;
+unsigned long captureStart = 0;   // when the current gesture began
 int idleRef = 0;     // Reading we watch for a hand while resting
 
 unsigned long lastPrint = 0;
@@ -236,14 +240,30 @@ void showLevel(int lv) {
 // Capture: the slider has been left somewhere, so mirror that position and swing
 // between the two. The mirror of x in [min, max] is (min + max - x).
 void detectFrom(int x) {
+  // Mimic the movement, not the destination.
+  //
+  // The hand's own two extremes are the ends of the swing, so a small gesture near
+  // the top gives a small swing near the top - the fader repeats what you did. Only
+  // when the gesture was too small to be one (a tap, a nudge) does it fall back to
+  // mirroring the position about the centre, which at least gives it something.
+  // Where you left it is the value that counts. That position picks the level off
+  // the measured scale, exactly as on the card, and the swing runs between it and
+  // its mirror about the centre.
+  int span = handMax - handMin;
   pointA = constrain(x, SLIDER_MIN, SLIDER_MAX);
   pointB = constrain(SLIDER_MIN + SLIDER_MAX - pointA, SLIDER_MIN, SLIDER_MAX);
 
   level = levelFor(pointA, level);
 
-  Serial.print("DETECTED x = ");
+  Serial.print("DETECTED value ");
   Serial.print(pointA);
-  Serial.print("  ->  MODE ");
+  Serial.print("  (moved ");
+  Serial.print(handMin);
+  Serial.print("-");
+  Serial.print(handMax);
+  Serial.print(", span ");
+  Serial.print(span);
+  Serial.print(")  ->  MODE ");
   Serial.print(LEVEL_NAME[level]);
   Serial.print("  swinging ");
   Serial.print(pointA);
@@ -275,8 +295,8 @@ void detectFrom(int x) {
     return;
   }
 
-  targetVal = pointB;
-  bestGap = abs(targetVal - pointA);
+  targetVal = (abs(x - pointA) > abs(x - pointB)) ? pointA : pointB;
+  bestGap = abs(targetVal - x);
   legStartGap = bestGap;
   grabArmed = false;
   boost = 0;
@@ -284,7 +304,7 @@ void detectFrom(int x) {
   stallTime = millis();
   holdTime = millis();
   against = 0;
-  prevSlider = pointA;
+  prevSlider = x;
   moveStart = millis();
   mode = SWINGING;
 }
@@ -308,6 +328,8 @@ void handDetected(int sliderVal) {
   Serial.println("HAND DETECTED - motor released, set it where you like");
   motorCoast();
   mode = GRABBED;
+  handMin = handMax = sliderVal;   // start measuring the gesture from here
+  captureStart = millis();
   settleRef = sliderVal;
   settleTime = millis();
 }
@@ -442,6 +464,18 @@ void loop() {
     // ---- Your hand is on it: motor off, wait for you to finish ----
     case GRABBED: {
       motorCoast();
+      // Measure the gesture, not just where it ends: the two extremes the hand
+      // reached are what the fader will ping-pong between.
+      if (sliderVal < handMin) handMin = sliderVal;
+      if (sliderVal > handMax) handMax = sliderVal;
+      // Three seconds is as long as we watch. Keep moving past that and it acts on
+      // where the fader is right then, rather than waiting for you to stop.
+      if (millis() - captureStart >= CAPTURE_MS) {
+        Serial.println("  (3s capture window closed)");
+        detectFrom(sliderVal);
+        break;
+      }
+
       if (abs(sliderVal - settleRef) > SETTLE_MOVE) {
         settleRef = sliderVal;
         settleTime = millis();

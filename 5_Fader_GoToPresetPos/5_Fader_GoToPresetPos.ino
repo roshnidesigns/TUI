@@ -10,7 +10,7 @@
 */
 
 // Pin Definitions
-#define MOTOR_IN1 4    // MX1508 IN1 (Motor A) - direction + speed
+#define MOTOR_IN1 7    // MX1508 IN1 (Motor A) - direction + speed
 #define MOTOR_IN2 5    // MX1508 IN2 (Motor A) - direction + speed
 #define SLIDER_PIN A1  // Analog input from slider's feedback potentiometer
 

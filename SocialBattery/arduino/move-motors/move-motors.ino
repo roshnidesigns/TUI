@@ -83,19 +83,24 @@
 */
 
 #include <Servo.h>
+#include <Adafruit_NeoPixel.h>
 
 // ---------------------------------------------------------------- pins
 //
 // One entry per arm. Add pins here and the whole sketch adapts — per-arm state,
 // telemetry and the arm count reported to the web page all size themselves from it.
 //
-const uint8_t SERVO_PIN[] = { 5, 3, 1 };
+// Set to 1 to bring the servo arms back. With them off, no pulses are ever sent and
+// the servos draw nothing — which leaves the whole supply for the fader motor.
+#define SERVOS_ENABLED 0
+
+const uint8_t SERVO_PIN[] = { 2, 3 };
 //
 // Arm order follows this array: index 0 is the blue square on the longest rod at the
 // back (D5), 1 the yellow wedge in the middle (D3), 2 the red octagon at the front (D1).
 //
-// D1 is also the MKR's Serial1 TX pin. This sketch never uses Serial1, so it's free to
-// drive a servo — but keep that in mind before adding anything that talks over Serial1.
+// D1 is a plain digital pin on the MKR (PA23, PWM and timer capable). Serial1 is on
+// D13/D14, not here, so there is no UART conflict to worry about.
 //
 // Avoid pins 8, 9 and 10 on the MKR WiFi 1010 — they are the SPI bus to the onboard
 // NINA WiFi module. A servo there works only until something switches the radio on.
@@ -106,65 +111,6 @@ const uint8_t LED_PIN   = LED_BUILTIN;   // pin 6 on the MKR boards
 
 // The SAMD Servo library drives any digital pin from a hardware timer rather than from
 // analogWrite, so the plain digital pins D3, D4 and D5 are all fine here.
-
-// ---------------------------------------------------------------- motorized fader
-//
-// The red arm's controller. The fader's built-in feedback pot sits on A1 exactly as a
-// plain dial would, but a motor can drive the slider back, so software can set it too.
-// Its pot runs on 3.3V, never 5V: the MKR's ADC reference is 3.3V and its analog pins
-// are not 5V tolerant.
-//
-const uint8_t SLIDER_PIN = A1;   // the fader's wiper
-const uint8_t POT_ARM = 2;       // red octagon — the arm the fader drives
-
-// HW-354 driver, Motor A. IN2 is on D2 rather than the usual D5: D5 is the blue arm's
-// servo signal. D9 has no PWM on the MKR at all, and 8/9/10 are the NINA WiFi SPI bus.
-const uint8_t MOTOR_IN1 = 4;
-const uint8_t MOTOR_IN2 = 2;
-
-const int MOTOR_SPEED  = 220;    // PWM duty while driving
-const int MARGIN_ERROR = 10;     // +/-1% of full scale — close enough, stop here
-
-// Motor noise on the analog line reads as movement, and defeats any naive "has it
-// moved?" check. Eight samples measured +/-1 count; a single read swung +/-15.
-const uint8_t SLIDER_SAMPLES = 8;
-
-// The real backstop: without it an unreachable target means pushing into a mechanical
-// stop at full duty forever.
-const unsigned long MOVE_TIMEOUT_MS = 8000;
-
-// Below this much measured travel the mapping is nonsense and we pass values through.
-const int MIN_TRAVEL = 100;
-
-// ---- how the fader's travel divides into the four levels --------------------------
-//
-// The fader does NOT cover the full ADC range: measured travel is about 274..762, so
-// raw readings never reach either end of 0..1023. Applying 0..1023 thresholds directly
-// would put "Off" below anything the slider can physically reach.
-//
-// So every position is worked in NORMALISED units — 0..1023 stretched across the
-// MEASURED travel — and the thresholds below keep their original meaning. Travel is
-// split into four equal quarters:
-//
-//   level     normalised    raw counts     the slider, physically
-//   Off         0 - 256      274 - 396     bottom quarter
-//   Low       256 - 512      396 - 518     second quarter
-//   Medium    512 - 768      518 - 640     third quarter
-//   High      768 - 1023     640 - 762     top quarter
-//
-// A commanded level parks at the MIDDLE of its quarter, never on a boundary where
-// noise could tip it into the neighbour:
-//
-//   Off 128 -> raw 335    Low 384 -> raw 457
-//   Med 640 -> raw 579    High 896 -> raw 701
-//
-const int SLIDER_MIN = 274;   // measured; boot calibration will replace these
-const int SLIDER_MAX = 762;
-
-const int POT_BOUND[3]   = { 256, 512, 768 };   // quarter boundaries, normalised
-const int POT_HYSTERESIS = 25;                  // dead zone so noise can't flicker a band
-const int BAND_TARGET[4] = { 128, 384, 640, 896 };   // mid-quarter parking spots
-
 
 // ---------------------------------------------------------------- tuning
 
@@ -288,6 +234,7 @@ uint8_t parseState(const char *n) {
 }
 
 void attachArm(uint8_t i, bool on) {
+  if (!SERVOS_ENABLED) return;   // arms parked: never attach, never pulse
   if (on == servosAttached[i]) return;
   if (on) servos[i].attach(SERVO_PIN[i]);
   else    servos[i].detach();
@@ -309,122 +256,16 @@ void startArm(uint8_t i, State s) {
   attachArm(i, true);
 }
 
-// Both skip POT_ARM: the fader is red's controller, and the standalone demo has no
-// business motoring a slider the user may have their hand on.
-void startAll(State s) { for (uint8_t i = 0; i < ARM_COUNT; i++) if (i != POT_ARM) startArm(i, s); }
+void startAll(State s) { for (uint8_t i = 0; i < ARM_COUNT; i++) startArm(i, s); }
+
+// Any command from outside takes the object off its standalone demo cycle.
+void takeControl() { autoCycle = false; }
 
 void stopArm(uint8_t i) { armRunning[i] = false; }   // eases home and holds there, powered
 void stopAll() {
-  for (uint8_t i = 0; i < ARM_COUNT; i++) if (i != POT_ARM) stopArm(i);
+  for (uint8_t i = 0; i < ARM_COUNT; i++) stopArm(i);
   holdCenter = false;
 }
-
-// ---------------------------------------------------------------- fader
-
-// Motor control. The HW-354 has no enable pin: direction AND speed both come from
-// IN1/IN2.
-//
-//   IN1   IN2   result
-//   LOW   LOW   coast — free to move by hand
-//   PWM   LOW   forward at duty
-//   LOW   PWM   backward at duty
-//   HIGH  HIGH  brake — resists movement, holds position
-//
-// Everything here uses analogWrite(), never digitalWrite(). On SAMD21 analogWrite()
-// re-muxes the pin to a timer peripheral, and a later digitalWrite() on that same pin
-// is silently ignored until pinMode() is called again — mixing the two leaves the motor
-// stuck on. analogWrite(pin, 0) is LOW and analogWrite(pin, 255) is HIGH.
-void motorCoast()             { analogWrite(MOTOR_IN1, 0);   analogWrite(MOTOR_IN2, 0); }
-void motorBrake()             { analogWrite(MOTOR_IN1, 255); analogWrite(MOTOR_IN2, 255); }
-void motorForward(int speed)  { analogWrite(MOTOR_IN2, 0);   analogWrite(MOTOR_IN1, speed); }
-void motorBackward(int speed) { analogWrite(MOTOR_IN1, 0);   analogWrite(MOTOR_IN2, speed); }
-
-// Stretch a raw reading across the measured travel, and back again.
-int sliderNorm(int raw) {
-  long span = SLIDER_MAX - SLIDER_MIN;
-  if (span < MIN_TRAVEL) return raw;            // travel implausible — pass it through
-  long v = (long)(raw - SLIDER_MIN) * 1023 / span;
-  return (int)(v < 0 ? 0 : (v > 1023 ? 1023 : v));
-}
-
-int sliderRawFor(int norm) {
-  long span = SLIDER_MAX - SLIDER_MIN;
-  if (span < MIN_TRAVEL) return norm;
-  if (norm < 0) norm = 0;
-  if (norm > 1023) norm = 1023;
-  return SLIDER_MIN + (int)((long)norm * span / 1023);
-}
-
-int readSlider() {
-  long sum = 0;
-  for (uint8_t i = 0; i < SLIDER_SAMPLES; i++) sum += analogRead(SLIDER_PIN);
-  return (int)(sum / SLIDER_SAMPLES);
-}
-
-// -1 means "not read yet" — that forces the very first call to settle on whatever band
-// the fader is actually sitting at, rather than assuming it starts at Off.
-int8_t potBand = -1;
-int sliderPos = 0;                 // last averaged reading, for telemetry
-int faderTarget = -1;              // -1 = idle and coasting, so hands always win
-unsigned long seekStart = 0;
-
-// Apply a band to the red arm. Band 0 is Off; 1/2/3 are LOW/MED/HIGH.
-void applyBand(int8_t band) {
-  if (band == potBand) return;
-  potBand = band;
-  if (band == 0) stopArm(POT_ARM);
-  else           startArm(POT_ARM, (State)(band - 1));
-}
-
-int8_t bandFor(int reading, int8_t current) {
-  int8_t band = (current < 0) ? 0 : current;
-  while (band < 3 && reading > POT_BOUND[band] + POT_HYSTERESIS) band++;
-  while (band > 0 && reading < POT_BOUND[band - 1] - POT_HYSTERESIS) band--;
-  return band;
-}
-
-// Start driving the fader somewhere. Coasting resumes the moment it arrives or gives up.
-void faderSeek(int target) {
-  faderTarget = target < 0 ? 0 : (target > 1023 ? 1023 : target);
-  seekStart = millis();
-}
-
-void faderSeekBand(int8_t band) { faderSeek(sliderRawFor(BAND_TARGET[band])); }
-
-void updateFader() {
-  sliderPos = readSlider();
-
-  // Idle: motor coasting, so the fader is free under your fingers and whatever position
-  // it is left at becomes red's level. This is the normal state.
-  if (faderTarget < 0) {
-    motorCoast();
-    applyBand(bandFor(sliderNorm(sliderPos), potBand));
-    return;
-  }
-
-  // Seeking. Give up rather than push into an end stop at full duty forever.
-  if (millis() - seekStart >= MOVE_TIMEOUT_MS) {
-    motorCoast();
-    faderTarget = -1;
-    Serial.println(F("ERR:fader seek timed out"));
-    applyBand(bandFor(sliderNorm(sliderPos), potBand));
-    return;
-  }
-
-  if (sliderPos > faderTarget + MARGIN_ERROR) {
-    motorBackward(MOTOR_SPEED);
-  } else if (sliderPos < faderTarget - MARGIN_ERROR) {
-    motorForward(MOTOR_SPEED);
-  } else {
-    // Arrived. Coast rather than brake — a braked fader feels dead to the touch.
-    motorCoast();
-    faderTarget = -1;
-    applyBand(bandFor(sliderNorm(sliderPos), potBand));
-  }
-}
-
-// Any command from outside takes the object off its demo cycle.
-void takeControl() { autoCycle = false; }
 
 // ---------------------------------------------------------------- motion
 
@@ -468,6 +309,533 @@ void updateArms(float dt) {
     // E:0 (or the web page's controls) if you need the linkage to move freely, e.g.
     // while re-taping an arm.
   }
+}
+
+// ================================================================== FADER
+//
+// A motorized fader with its own NeoPixel strip, on its own pins. It reads,
+// captures and mimics a hand-set gesture entirely on its own - it neither
+// drives the servo arms nor is driven by them. The two subsystems share only
+// the board and the serial port.
+// ==========================================================================
+
+// ---- motorized fader + NeoPixel (independent of the arms) -------------------
+#define MOTOR_IN1 7    // HW-354 IN1 - moved off D4, which is also PIN_SPI_SS
+#define MOTOR_IN2 5    // HW-354 IN2 (Motor A) - direction + speed
+#define SLIDER_PIN A1  // the fader's wiper
+#define STRIP_PIN 1    // NeoPixel data
+
+// ---- Travel limits, measured on the bench ----------------------------------
+#define SLIDER_MIN 336      // reading at the low mechanical stop
+#define SLIDER_MAX 753      // reading at the high stop
+#define SLIDER_CENTER ((SLIDER_MIN + SLIDER_MAX) / 2)   // 544
+
+// ---- The levels ------------------------------------------------------------
+// The faderLevel is how far the slider sits FROM THE CENTRE, in either direction - so
+// the scale is symmetric, and pushing away from the middle in either direction
+// raises the intensity. That is what makes the mirror swing work: a position and
+// its reflection are always the same faderLevel.
+//
+//     336 / 753  ->  208 from centre  ->  HIGH
+//     386 / 703  ->  158              ->  MEDIUM
+//     436 / 653  ->  108              ->  LOW
+//     500        ->   44              ->  OFF
+//
+// Boundaries sit midway between the measured points.
+#define DIST_OFF_LOW   77
+#define DIST_LOW_MED  134
+#define DIST_MED_HIGH 184
+
+// A boundary has to be cleared by this much before the faderLevel actually changes, so
+// a reading sitting right on a mark cannot flicker between two levels.
+#define BAND_HYSTERESIS 8
+
+// ---- NeoPixel --------------------------------------------------------------
+// Eight pixels. The lit pair moves OUTWARD from the middle as the faderLevel rises,
+// so the strip reads as the battery opening up.
+//
+//     off      nothing
+//     low      pixels 4,5            the middle pair
+//     medium   pixels 3,4,5,6        widening
+//     high     pixels 1..8           the whole strip
+//
+// Numbering below is 0-based, so your 1..8 become 0..7.
+#define STRIP_COUNT 8
+#define STRIP_BRIGHTNESS 90
+
+// How hard each faderLevel is driven. The swing's ENDS come from the mirror - where you
+// left the slider, and its reflection - so the gesture is yours; the faderLevel only says
+// how energetically it comes back.
+//                            Off  Low  Medium  High
+const int SWING_SPEED[4] = {   0,  230,   243,   255 };
+const char* LEVEL_NAME[4] = { "OFF", "LOW", "MEDIUM", "HIGH" };
+
+// Below this the two ends are too close together to be worth swinging between
+#define MIN_SWING 60
+
+// Overshoot control. At full duty the fader sails past the target, which then reads
+// as the gap growing. Ease off over the last stretch instead of arriving flat out.
+// The floor is the lowest duty that still reliably breaks friction - not measured,
+// so it is set conservatively high.
+#define RAMP_ZONE 120
+#define MIN_DUTY 215        // 154 did not move it at all; 190 still crawled
+
+// Friction varies along the track and between faders, and the duty that actually
+// breaks it has never been measured properly. So rather than trust a guess: if the
+// slider stops making progress while we are driving it, wind the duty up until it
+// moves again, and report the value that worked.
+#define STALL_MS 200        // no progress for this long while driving = stuck
+#define STALL_STEP 12       // how much to add each time
+#define STALL_NOISE 2       // counts of change that do not count as progress
+#define BOOST_MAX 60        // never wind past this - beyond it, assume a hand
+#define HOLD_MS 500         // pushing at full boost this long without moving = held
+
+int driveSpeed(int gap, int full) {
+  // Nothing to taper if the level already runs at or below the friction floor -
+  // and tapering anyway inverted the ramp, making the slowest level speed UP as it
+  // approached its target.
+  if (full <= MIN_DUTY) return full;
+  if (gap >= RAMP_ZONE) return full;
+  int duty = MIN_DUTY + (long)(full - MIN_DUTY) * gap / RAMP_ZONE;
+  if (duty < MIN_DUTY) duty = MIN_DUTY;
+  if (duty > full) duty = full;      // a taper must never exceed the cruise speed
+  return duty;
+}
+
+// ---- Control Parameters ----------------------------------------------------
+#define HOMING_SPEED 220               // Speed used to drive to the Off mark
+#define FADER_MARGIN 10                // Acceptable position error, ~1% of range
+#define PRINT_INTERVAL 200             // How often to print debug values (ms)
+#define FADER_MOVE_TIMEOUT 8000              // Give up on an end rather than push into
+                                       // a mechanical stop forever
+#define FADER_SAMPLES 8                      // analogRead samples averaged per reading
+
+// ---- Hand detection --------------------------------------------------------
+// While driving, the slider should get steadily CLOSER to its target. If the gap
+// instead grows by more than this, something is pushing back - you.
+// Catching a hand while the motor is driving.
+//
+// The old test - "the gap to the target grew" - needed the leg to have closed 45
+// counts before it would arm, so grabbing early in a leg was simply invisible. And
+// it needed a big push to register. This looks at DIRECTION instead: the slider
+// should be moving the way we are driving it, and if it moves the other way, that is
+// a hand. Far more sensitive, and it works from the first moment of a leg.
+//
+// The only thing it has to forgive is the instant after a turn, when the fader is
+// still carrying momentum the old way - hence a short grace period rather than a
+// distance threshold.
+#define GRACE_MS 150        // ignore direction right after a turn
+#define REVERSE_MARGIN 12   // counts moved against the drive = a hand
+#define GRAB_MARGIN 45      // legacy gap test, kept as a slower backstop
+#define SETTLE_MOVE 8      // Counts of change that still count as "hand moving"
+#define SETTLE_MS 400      // Hand still this long = you let go
+
+// Function Declarations
+void motorCoast();
+void motorStop();
+void motorForward(int speed);
+void motorBackward(int speed);
+
+// ---- State -----------------------------------------------------------------
+int faderLevel = 0;       // 0 Off, 1 Low, 2 Medium, 3 High
+int pointA = 0;      // low end of the current swing
+int pointB = 0;      // high end
+int targetVal = 0;   // whichever end we are heading for right now
+
+enum FaderMode { FD_HOMING, FD_SWINGING, FD_GRABBED, FD_IDLE };
+FaderMode faderMode = FD_HOMING;
+
+int bestGap = 0;     // Closest we have got to the target on this leg
+int legStartGap = 0; // Gap when this leg began
+bool grabArmed = false;  // Grab detection only counts once the leg is making progress
+int prevSlider = 0;      // Last reading, for working out which way it is moving
+int against = 0;         // Counts moved against the drive on this leg
+unsigned long holdTime = 0;
+int stallRef = 0;        // Reading the stall timer measures progress against
+unsigned long stallTime = 0;
+int boost = 0;           // Extra duty added to break friction when stuck
+int boostReported = 0;   // Highest boost we have mentioned, so it is logged once
+int settleRef = 0;   // Reading the settle timer is measured against
+int idleRef = 0;     // Reading we watch for a hand while resting
+
+unsigned long faderLastPrint = 0;
+unsigned long moveStart = 0;
+unsigned long settleTime = 0;
+
+const char* faderPhaseName() {
+  if (faderMode == FD_HOMING)  return "FD_HOMING  ";
+  if (faderMode == FD_IDLE)    return "RESTING ";
+  if (faderMode == FD_GRABBED) return "HAND    ";
+  return "FD_SWINGING";
+}
+
+// Average several samples. A single analogRead picks up motor noise, which would
+// otherwise look like movement - or like a hand on the slider. Measured +/-1
+// count at 8 samples, against +/-15 with a single read.
+int readSlider() {
+  long total = 0;
+  for (int i = 0; i < FADER_SAMPLES; i++) {
+    total += analogRead(SLIDER_PIN);
+  }
+  return (int)(total / FADER_SAMPLES);
+}
+
+// Which faderLevel a reading falls in, from its distance either side of centre.
+// `current` is the faderLevel already showing; a reading has to clear the boundary by
+// BAND_HYSTERESIS to move off it, so noise on a mark cannot flicker the faderLevel.
+int levelFor(int reading, int current) {
+  int dist = abs(reading - SLIDER_CENTER);
+  const int edge[3] = { DIST_OFF_LOW, DIST_LOW_MED, DIST_MED_HIGH };
+
+  int lv = current;
+  while (lv < 3 && dist > edge[lv] + BAND_HYSTERESIS) lv++;
+  while (lv > 0 && dist < edge[lv - 1] - BAND_HYSTERESIS) lv--;
+  return lv;
+}
+
+// ---- NeoPixel --------------------------------------------------------------------
+Adafruit_NeoPixel strip(STRIP_COUNT, STRIP_PIN, NEO_GRB + NEO_KHZ800);
+
+// Which pixels each faderLevel lights, as a bitmask over 0..7. The fill grows OUTWARD
+// from the middle pair, so the strip reads as a faderLevel rising rather than a pattern
+// changing - each faderLevel keeps everything the one below it lit.
+//
+//     off      nothing
+//     low      4,5              the middle pair
+//     medium   3,4,5,6          widening
+//     high     1,2,3,4,5,6,7,8  the whole strip
+//
+// Bit 0 is pixel 1, so the masks below read right-to-left.
+const uint8_t STRIP_MASK[4] = { 0b00000000, 0b00011000, 0b00111100, 0b11111111 };
+
+// Colour per faderLevel. The fill grows outward AND heats up as the faderLevel rises.
+const uint32_t STRIP_COLOUR[4] = {
+  0x000000,   // off
+  0xFFC400,   // low    - yellow
+  0xFF6A00,   // medium - orange
+  0xFF1FA0,   // high   - magenta
+};
+
+int shownLevel = -1;   // so the strip is only rewritten when it actually changes
+
+void showLevel(int lv) {
+  if (lv == shownLevel) return;
+  shownLevel = lv;
+
+  uint8_t mask = STRIP_MASK[lv];
+  uint32_t c = STRIP_COLOUR[lv];
+  for (int i = 0; i < STRIP_COUNT; i++) {
+    strip.setPixelColor(i, (mask & (1 << i)) ? c : 0);
+  }
+  strip.show();
+}
+
+// Capture: the slider has been left somewhere, so mirror that position and swing
+// between the two. The mirror of x in [min, max] is (min + max - x).
+void detectFrom(int x) {
+  pointA = constrain(x, SLIDER_MIN, SLIDER_MAX);
+  pointB = constrain(SLIDER_MIN + SLIDER_MAX - pointA, SLIDER_MIN, SLIDER_MAX);
+
+  faderLevel = levelFor(pointA, faderLevel);
+
+  Serial.print("DETECTED x = ");
+  Serial.print(pointA);
+  Serial.print("  ->  MODE ");
+  Serial.print(LEVEL_NAME[faderLevel]);
+  Serial.print("  swinging ");
+  Serial.print(pointA);
+  Serial.print(" <-> ");
+  Serial.print(pointB);
+  Serial.print("  at speed ");
+  Serial.println(SWING_SPEED[faderLevel]);
+
+  if (faderLevel == 0) {
+    // Off just rests where you left it. Centring happens once, at power-up, and
+    // never again - dragging it back to the middle every time would fight you.
+    Serial.println("  (OFF - resting here)");
+    motorCoast();
+    idleRef = pointA;
+    targetVal = pointA;
+    faderMode = FD_IDLE;
+    return;
+  }
+
+  if (abs(pointB - pointA) < MIN_SWING) {
+    // x sat near the middle, so x and its mirror nearly coincide. Twitching across
+    // a few counts reads as a fault, so rest here and wait for a hand to give us
+    // something to work with.
+    Serial.println("  (too close to the centre to swing - resting, move the slider)");
+    motorCoast();
+    idleRef = pointA;
+    targetVal = pointA;
+    faderMode = FD_IDLE;
+    return;
+  }
+
+  targetVal = pointB;
+  bestGap = abs(targetVal - pointA);
+  legStartGap = bestGap;
+  grabArmed = false;
+  boost = 0;
+  stallRef = -999;
+  stallTime = millis();
+  holdTime = millis();
+  against = 0;
+  prevSlider = pointA;
+  moveStart = millis();
+  faderMode = FD_SWINGING;
+}
+
+// Flip to the other end of the swing and restart this leg
+void swapTarget(int sliderVal) {
+  targetVal = (targetVal == pointA) ? pointB : pointA;
+  bestGap = abs(targetVal - sliderVal);
+  legStartGap = bestGap;
+  grabArmed = false;
+  boost = 0;
+  stallRef = -999;
+  stallTime = millis();
+  holdTime = millis();
+  against = 0;
+  prevSlider = sliderVal;
+  moveStart = millis();
+}
+
+void handDetected(int sliderVal) {
+  Serial.println("HAND DETECTED - motor released, set it where you like");
+  motorCoast();
+  faderMode = FD_GRABBED;
+  settleRef = sliderVal;
+  settleTime = millis();
+}
+
+void faderSetup() {
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+  motorCoast();
+
+  strip.begin();
+  strip.setBrightness(STRIP_BRIGHTNESS);
+  strip.clear();
+  strip.show();
+
+  Serial.print(F("fader: travel ")); Serial.print(SLIDER_MIN);
+  Serial.print(F(" - ")); Serial.print(SLIDER_MAX);
+  Serial.print(F(", centre ")); Serial.println(SLIDER_CENTER);
+  Serial.print(F("fader: homing to ")); Serial.println(SLIDER_CENTER);
+  moveStart = millis();
+  faderMode = FD_HOMING;
+}
+
+void faderUpdate() {
+  int sliderVal = readSlider();
+
+  // The strip shows the faderLevel you SET, and holds it.
+  //
+  // Not the faderLevel of wherever the slider happens to be this millisecond: during a
+  // swing the fader sweeps across every band on its way between the two ends, so
+  // following the live reading made the lights flicker through yellow, orange and
+  // magenta continuously. The colour only changes when you set a new faderLevel.
+  showLevel(faderLevel < 0 ? 0 : faderLevel);
+
+  // Print status on an interval. Never use delay() here - the loop has to keep
+  // sampling, or it misses the movement it is supposed to detect.
+  if (millis() - faderLastPrint >= PRINT_INTERVAL) {
+    faderLastPrint = millis();
+
+    unsigned long ms = millis();
+    Serial.print("t=");
+    Serial.print(ms / 1000);
+    Serial.print(".");
+    unsigned long frac = ms % 1000;
+    if (frac < 100) Serial.print("0");
+    if (frac < 10)  Serial.print("0");
+    Serial.print(frac);
+    Serial.print("s  ");
+
+    Serial.print(faderPhaseName());
+    Serial.print("  slider: ");
+    Serial.print(sliderVal);
+    Serial.print("  faderLevel: ");
+    Serial.print(LEVEL_NAME[faderLevel]);
+    Serial.print("  target: ");
+    if (faderMode == FD_HOMING) Serial.println(SLIDER_CENTER);
+    else if (faderMode == FD_SWINGING) Serial.println(targetVal);
+    else Serial.println("-");
+  }
+
+  switch (faderMode) {
+
+    // ---- Drive to the Off mark on power-up ----
+    case FD_HOMING: {
+      bool timedOut = (millis() - moveStart >= FADER_MOVE_TIMEOUT);
+
+      if (abs(SLIDER_CENTER - sliderVal) <= FADER_MARGIN || timedOut) {
+        motorStop();
+        if (timedOut) {
+          Serial.print("FD_HOMING gave up at ");
+          Serial.println(sliderVal);
+        } else {
+          Serial.print("AT OFF MARK ");
+          Serial.println(sliderVal);
+        }
+        // Settle here rather than calling detectFrom() again: at the centre the faderLevel
+        // is OFF, and OFF sends us back to FD_HOMING, which would loop forever.
+        motorCoast();
+        faderLevel = levelFor(sliderVal, faderLevel);
+        idleRef = sliderVal;
+        targetVal = sliderVal;
+        faderMode = FD_IDLE;
+        Serial.print("  resting at ");
+        Serial.print(sliderVal);
+        Serial.print(", faderLevel ");
+        Serial.println(LEVEL_NAME[faderLevel]);
+      } else if (sliderVal > SLIDER_CENTER) {
+        motorBackward(HOMING_SPEED);
+      } else {
+        motorForward(HOMING_SPEED);
+      }
+      break;
+    }
+
+    // ---- Resting: motor off, waiting for a hand ----
+    case FD_IDLE: {
+      motorCoast();
+      if (abs(sliderVal - idleRef) > SETTLE_MOVE) {
+        Serial.println("HAND DETECTED - set it where you like");
+        faderMode = FD_GRABBED;
+        settleRef = sliderVal;
+        settleTime = millis();
+      }
+      break;
+    }
+
+    // ---- Your hand is on it: motor off, wait for you to finish ----
+    case FD_GRABBED: {
+      motorCoast();
+      if (abs(sliderVal - settleRef) > SETTLE_MOVE) {
+        settleRef = sliderVal;
+        settleTime = millis();
+      } else if (millis() - settleTime >= SETTLE_MS) {
+        // Still for long enough - that is where you wanted it
+        detectFrom(sliderVal);
+      }
+      break;
+    }
+
+    // ---- Swinging across the selected faderLevel's range ----
+    case FD_SWINGING: {
+      int gap = abs(targetVal - sliderVal);
+      int dir = (targetVal > sliderVal) ? 1 : -1;      // the way we are driving
+      int delta = sliderVal - prevSlider;              // the way it actually went
+      prevSlider = sliderVal;
+
+      bool pastGrace = (millis() - moveStart >= GRACE_MS);
+
+      // Moving against the drive is a hand - nothing else pushes back.
+      if (delta * dir > 0) {
+        against = 0;                    // making progress, forget any wobble
+      } else if (delta * dir < 0) {
+        against += -delta * dir;
+        if (pastGrace && against > REVERSE_MARGIN) {
+          handDetected(sliderVal);
+          break;
+        }
+      }
+
+      // Safety net - if an end cannot be reached, swing back rather than grind
+      if (millis() - moveStart >= FADER_MOVE_TIMEOUT) {
+        Serial.print("GAVE UP at ");
+        Serial.print(sliderVal);
+        Serial.print(" chasing ");
+        Serial.println(targetVal);
+        motorStop();
+        swapTarget(sliderVal);
+        break;
+      }
+
+      if (gap > FADER_MARGIN) {
+        if (abs(sliderVal - stallRef) > STALL_NOISE) {
+          // moving again
+          stallRef = sliderVal;
+          stallTime = millis();
+          holdTime = millis();
+          if (boost > boostReported) {
+            Serial.print("  broke friction at duty +");
+            Serial.println(boost);
+            boostReported = boost;
+          }
+          boost = 0;
+        } else if (millis() - stallTime >= STALL_MS) {
+          stallTime = millis();
+          // Wind up to break friction - but only so far. Past BOOST_MAX the thing
+          // stopping it is not friction, it is a hand holding it still, and shoving
+          // harder is precisely the wrong answer.
+          if (boost < BOOST_MAX) {
+            boost += STALL_STEP;
+          } else if (pastGrace && millis() - holdTime >= HOLD_MS) {
+            Serial.println("  (held still against full drive - treating as a hand)");
+            handDetected(sliderVal);
+            break;
+          }
+        }
+      }
+
+      int duty = driveSpeed(gap, SWING_SPEED[faderLevel]) + boost;
+      if (duty > 255) duty = 255;
+
+      if (sliderVal > targetVal + FADER_MARGIN) {
+        motorBackward(duty);
+      } else if (sliderVal < targetVal - FADER_MARGIN) {
+        motorForward(duty);
+      } else {
+        // Reached this end - turn around immediately, no dwell
+        motorStop();
+        swapTarget(sliderVal);
+      }
+      break;
+    }
+  }
+}
+
+// Motor Control Functions
+//
+// The HW-354 board has no enable pin: direction AND speed both come from
+// IN1/IN2. Hold one input LOW and PWM the other to drive at that speed.
+//
+//   IN1   IN2   result
+//   LOW   LOW   coast  - free to move by hand
+//   PWM   LOW   forward at duty
+//   LOW   PWM   backward at duty
+//   HIGH  HIGH  brake  - resists movement, holds position
+//
+// Everything below uses analogWrite() rather than digitalWrite(). On the
+// MKR 1010 (SAMD21) analogWrite() re-muxes the pin to a timer peripheral, and a
+// later digitalWrite() on that same pin is ignored until pinMode() is called
+// again. Staying on analogWrite() the whole way avoids that trap.
+
+void motorCoast() {
+  // Both inputs LOW - motor unpowered, slider moves freely by hand
+  analogWrite(MOTOR_IN1, 0);
+  analogWrite(MOTOR_IN2, 0);
+}
+
+void motorStop() {
+  // Brake motor by setting both inputs HIGH (full duty)
+  analogWrite(MOTOR_IN1, 255);
+  analogWrite(MOTOR_IN2, 255);
+}
+
+void motorForward(int speed) {
+  // Idle pin first so the two inputs are never briefly both driven
+  analogWrite(MOTOR_IN2, 0);
+  analogWrite(MOTOR_IN1, speed);
+}
+
+void motorBackward(int speed) {
+  // Idle pin first so the two inputs are never briefly both driven
+  analogWrite(MOTOR_IN1, 0);
+  analogWrite(MOTOR_IN2, speed);
 }
 
 // ---------------------------------------------------------------- serial
@@ -526,7 +894,6 @@ void handleLine(char *s) {
     if (s[1] == ':') {
       int idx = atoi(s + 2);
       if (idx < 0 || idx >= ARM_COUNT) { Serial.println(F("ERR:arm out of range")); return; }
-      if (idx == POT_ARM) faderSeekBand(0);   // stop red = drive the fader down to Off
       stopArm(idx);
       Serial.print(F("OK:X ")); Serial.println(idx);
     } else {
@@ -549,7 +916,6 @@ void handleLine(char *s) {
       if (idx < 0 || idx >= ARM_COUNT) { Serial.println(F("ERR:arm out of range")); return; }
       // The fader arm is commandable now: set the state AND drive the slider to match,
       // so the physical control never disagrees with what the software thinks red is.
-      if (idx == POT_ARM) faderSeekBand(st + 1);
       if (st >= STATE_COUNT)           { Serial.println(F("ERR:unknown state")); return; }
       startArm(idx, (State)st);
       Serial.print(F("OK:T ")); Serial.print(idx);
@@ -606,14 +972,18 @@ void handleLine(char *s) {
     return;
   }
 
-  // F:<0-1023> — drive the fader to a raw position
-  if (kind == 'F' && s[1] == ':') {
-    takeControl();
-    int target = atoi(s + 2);
-    if (target < 0 || target > 1023) { Serial.println(F("ERR:fader position 0-1023")); return; }
-    faderSeek(sliderRawFor(target));   // normalised in, raw counts out
-    Serial.print(F("OK:F ")); Serial.print(target);
-    Serial.print(F(" raw=")); Serial.println(sliderRawFor(target));
+  // D:<duty> — drive the fader motor directly, bypassing every bit of logic.
+  // Positive drives forward, negative backward, 0 coasts. Purely a wiring/supply
+  // probe: if this does nothing, the fault is not in the control code.
+  if (kind == 'D' && s[1] == ':') {
+    int duty = atoi(s + 2);
+    faderMode = FD_IDLE;                 // stop the fader's own state machine fighting us
+    if (duty == 999)   motorStop();      // brake: both inputs HIGH, windings shorted
+    else if (duty > 0) motorForward(duty > 255 ? 255 : duty);
+    else if (duty < 0) motorBackward(-duty > 255 ? 255 : -duty);
+    else               motorCoast();
+    Serial.print(F("OK:D ")); Serial.print(duty);
+    Serial.print(F(" slider=")); Serial.println(readSlider());
     return;
   }
 
@@ -637,6 +1007,7 @@ void readSerial() {
   }
 }
 
+
 // ---------------------------------------------------------------- arduino
 
 void setup() {
@@ -656,21 +1027,10 @@ void setup() {
   playPattern(PATTERN_HELLO);   // says "I booted" without blocking the loop
 
   Serial.print(F("OK:READY social-battery ARMS="));
-  Serial.println(ARM_COUNT);
+  Serial.println(SERVOS_ENABLED ? ARM_COUNT : 0);
+  if (!SERVOS_ENABLED) Serial.println(F("servo arms are PARKED (SERVOS_ENABLED 0) - fader only"));
   Serial.println(F("keys: 1/2/3 = low/med/high, 0 = stop, a = demo cycle, c = hold centre"));
-  Serial.print(F("fader travel ")); Serial.print(SLIDER_MIN);
-  Serial.print(F("..")); Serial.print(SLIDER_MAX);
-  Serial.println(F(" raw, split into four equal quarters:"));
-  for (uint8_t b = 0; b < 4; b++) {
-    Serial.print(F("  "));
-    Serial.print(b == 0 ? "Off   " : STATE_NAME[b - 1]);
-    Serial.print(F("\traw "));
-    Serial.print(b == 0 ? SLIDER_MIN : sliderRawFor(POT_BOUND[b - 1]));
-    Serial.print(F(" - "));
-    Serial.print(b == 3 ? SLIDER_MAX : sliderRawFor(POT_BOUND[b]));
-    Serial.print(F("\tparks at "));
-    Serial.println(sliderRawFor(BAND_TARGET[b]));
-  }
+  faderSetup();
 
   lastTick = millis();
   lastSwitch = 0;               // start the demo cycle immediately
@@ -679,12 +1039,12 @@ void setup() {
 void loop() {
   readSerial();
   updateLed();
-  updateFader();
+  faderUpdate();      // the fader runs its own loop, independent of the arms
 
   unsigned long now = millis();
 
   // Standalone demo: walk every arm through the states until something takes over.
-  if (autoCycle && (lastSwitch == 0 || now - lastSwitch >= DWELL_MS)) {
+  if (SERVOS_ENABLED && autoCycle && (lastSwitch == 0 || now - lastSwitch >= DWELL_MS)) {
     if (lastSwitch != 0) cycleState = (cycleState + 1) % STATE_COUNT;
     lastSwitch = now;
     startAll((State)cycleState);
@@ -701,15 +1061,5 @@ void loop() {
     lastReport = now;
     report();
     // Fader state on its own line, so the S: format stays exactly as it was.
-    // FD:<normalised>,<band>,<seeking>,<raw> — normalised leads so the page works in
-    // one consistent 0-1023 space and never has to know the fader's real travel.
-    Serial.print(F("FD:"));
-    Serial.print(sliderNorm(sliderPos));
-    Serial.print(',');
-    Serial.print(potBand < 0 ? 0 : potBand);
-    Serial.print(',');
-    Serial.print(faderTarget >= 0 ? 1 : 0);
-    Serial.print(',');
-    Serial.println(sliderPos);
   }
 }

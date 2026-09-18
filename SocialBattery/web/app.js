@@ -17,7 +17,7 @@ const ANGLE_MIN = 10, ANGLE_MAX = 170;
 
 // Labels for the arm rows. The pin list must match SERVO_PIN[] in the sketch.
 // Arms are identified by colour, not by index — that's what's visible on the object.
-const ARM_PINS  = ["D5", "D3", "D1"];
+const ARM_PINS  = ["D2", "D3", "—"];
 const ARM_COLOR = ["Blue", "Yellow", "Red"];
 const ARM_SHAPE = ["square", "wedge", "octagon"];
 const ARM_CLASS = ["blue", "yellow", "red"];
@@ -437,7 +437,6 @@ function startArm(i, name) {
 
 function startAll(name) {
   for (let i = 0; i < liveArms(); i++) {
-    if (i === POT_ARM) continue;   // the dial's alone to set red — "all" means all the rest
     const a = arms[i];
     if (!a.running) a.amp = STATES[name].amp;
     a.name = name;
@@ -449,7 +448,7 @@ function startAll(name) {
 
 function stopArm(i) { arms[i].running = false; paintState(); send(`X:${i}`); }
 function stopAll() {
-  arms.forEach((a, i) => { if (i !== POT_ARM) a.running = false; });
+  arms.forEach((a) => (a.running = false));
   paintState();
   send("X");
 }
@@ -485,36 +484,13 @@ arms.forEach((_, i) => {
   row.className = "arm-row";
   row.dataset.arm = i;
 
-  // Red has a physical dial wired to the board instead of buttons. With no board
-  // connected, this dial IS the real thing — drag it and red follows, same banding math
-  // as the sketch. Once a board is connected it goes read-only and just shows what the
-  // real dial + telemetry report, since nothing here can actually reach the real ADC.
-  // The ring is drawn in four arcs so the Off/Low/Medium/High angle ranges are visible
-  // at a glance, not just implied by a linear slider.
-  const controls = i === POT_ARM
-    ? `<div class="pot-control">
-         <svg class="pot-dial" viewBox="0 0 140 140" width="72" height="72">
-           <path class="pot-arc off"  d="M36.06,103.94 A48,48 0 0 1 25.65,51.63"/>
-           <path class="pot-arc low"  d="M25.65,51.63 A48,48 0 0 1 70,22"/>
-           <path class="pot-arc med"  d="M70,22 A48,48 0 0 1 114.35,51.63"/>
-           <path class="pot-arc high" d="M114.35,51.63 A48,48 0 0 1 103.94,103.94"/>
-           <text class="pot-tick" x="11.15" y="81.71">Off</text>
-           <text class="pot-tick" x="36.66" y="20.11">Low</text>
-           <text class="pot-tick" x="103.34" y="20.11">Med</text>
-           <text class="pot-tick" x="128.85" y="81.71">Hi</text>
-           <g class="pot-needle-group">
-             <line class="pot-needle" x1="70" y1="70" x2="70" y2="32"/>
-           </g>
-           <circle class="pot-hub" cx="70" cy="70" r="4"/>
-         </svg>
-         <small class="pot-band">Off</small>
-       </div>`
-    : `<div class="seg" data-arm="${i}">
-         <button data-state="LOW">Low</button>
-         <button data-state="MED">Medium</button>
-         <button data-state="HIGH">High</button>
-       </div>
-       <button class="btn ghost tiny" data-stop="${i}">Stop</button>`;
+  const controls =
+    `<div class="seg" data-arm="${i}">
+       <button data-state="LOW">Low</button>
+       <button data-state="MED">Medium</button>
+       <button data-state="HIGH">High</button>
+     </div>
+     <button class="btn ghost tiny" data-stop="${i}">Stop</button>`;
 
   row.innerHTML = `
     <span class="arm-id">
@@ -524,55 +500,6 @@ arms.forEach((_, i) => {
     ${controls}
     <span class="arm-live"><b class="deg">—</b><small class="params"></small></span>`;
   rowsEl.appendChild(row);
-});
-
-const potControl = rowsEl.querySelector(".pot-control");
-const potDial = rowsEl.querySelector(".pot-dial");
-const potNeedleGroup = rowsEl.querySelector(".pot-needle-group");
-const potBandLabel = rowsEl.querySelector(".pot-band");
-
-// Dragging anywhere on the dial sets the angle from the pointer's position relative to
-// its centre — clicking straight down on it jumps there immediately, same as a real
-// knob would under a fingertip, and dragging follows continuously from there.
-function potValueFromPointer(evt) {
-  const rect = potDial.getBoundingClientRect();
-  const cx = rect.left + rect.width / 2;
-  const cy = rect.top + rect.height / 2;
-  const angle = clamp(
-    Math.atan2(evt.clientX - cx, -(evt.clientY - cy)) * 180 / Math.PI,
-    -135, 135
-  );
-  return potValueForAngle(angle);
-}
-
-// The fader is motorized, so the dial commands it rather than only reflecting it.
-// Dragging sends F:<pos> and the motor drives the real slider there. Moving the
-// physical fader by hand still wins — the board idles coasting and reports its true
-// position back over FD:, which overwrites whatever the dial last showed.
-const sendFader = throttle((v) => send(`F:${v}`), 90);
-
-function driveFaderFromPointer(evt) {
-  potValue = potValueFromPointer(evt);
-  if (state.connected) {
-    // Send ONLY the position. applyPotBand() would emit T:2:<state>, which the board
-    // now answers with a seek of its own to that band's centre — that would fight the
-    // drag. The board derives the band from its own ADC and reports it back on FD:.
-    sendFader(potValue);
-  } else {
-    applyPotBand(potBandFor(potValue, potBand));   // simulation: we are the board
-  }
-}
-
-potDial.addEventListener("pointerdown", (evt) => {
-  // Capture is what lets the drag keep tracking past the dial's own edge — but it can
-  // throw for a pointer the browser doesn't consider active, and a value this central
-  // to the interaction shouldn't hinge on that call succeeding.
-  try { potDial.setPointerCapture(evt.pointerId); } catch { /* drag still works without it */ }
-  driveFaderFromPointer(evt);
-});
-potDial.addEventListener("pointermove", (evt) => {
-  if (evt.buttons !== 1) return;
-  driveFaderFromPointer(evt);
 });
 
 // ---------------------------------------------------------------- render
@@ -617,13 +544,6 @@ function render() {
     c.setAttribute("opacity", on ? 1 : 0.55);
   });
 
-  // The label always reflects reality. The needle follows potValue while simulating
-  // (the dial IS what's driving red then), or snaps to the real band's angle once a
-  // board is connected — never the reverse.
-  const band = currentPotBand();
-  potBandLabel.textContent = POT_BAND_NAME[band];
-  const needleAngle = state.connected ? angleForPotValue(POT_BAND_MID[band]) : angleForPotValue(potValue);
-  potNeedleGroup.setAttribute("transform", `rotate(${needleAngle.toFixed(1)} 70 70)`);
 }
 
 // Plain words for what the fader is physically doing right now.
@@ -655,7 +575,6 @@ function paintFader() {
 }
 
 function paintState() {
-  potControl.classList.toggle("seeking", faderSeeking);
   paintFader();
 
   const live = liveArms();
@@ -664,7 +583,6 @@ function paintState() {
     const a = arms[i];
     const liveRow = isArmLive(i);
     row.classList.toggle("off", !liveRow);
-    if (i === POT_ARM) return;   // no buttons on this row — the dial has no "disabled"
     row.querySelectorAll(".seg button").forEach((b) => {
       b.classList.toggle("on", a.running && b.dataset.state === a.name);
       b.disabled = !liveRow;
@@ -674,7 +592,7 @@ function paintState() {
 
   // "All arms" only ever touches the non-dial arms, so its own highlighting should only
   // ever look at those — red agreeing or not is beside the point, it's not part of "all".
-  const settable = arms.slice(0, live).filter((_, i) => i !== POT_ARM);
+  const settable = arms.slice(0, live);
   const allSame = settable.length > 0 && settable.every((a) => a.running && a.name === settable[0].name);
   document.querySelectorAll('.arm-row.all .seg button').forEach((b) => {
     b.classList.toggle("on", allSame && b.dataset.state === settable[0]?.name);
