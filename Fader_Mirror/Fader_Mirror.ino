@@ -34,8 +34,15 @@
 #define SLIDER_PIN A1  // Analog input from slider's feedback potentiometer
 
 // ---- Travel limits, measured on the bench ----------------------------------
-#define SLIDER_MIN 336      // reading at the low mechanical stop
-#define SLIDER_MAX 753      // reading at the high stop
+#define SLIDER_MIN 255      // low stop, measured by hand with the motor off
+#define SLIDER_MAX 825      // high stop, measured by hand with the motor off
+
+// How far outside that travel a reading may sit before it is treated as noise. The
+// motor throws a lot of electrical rubbish onto the analog line, and the readings it
+// produces are not near-misses — they are 0 and 1023, the rails, which the slider
+// cannot physically reach. Anything out here is discarded and the last good reading
+// stands. This is what was making HIGH glitch: that is when the motor works hardest.
+#define SLIDER_SLACK 40
 #define SLIDER_CENTER ((SLIDER_MIN + SLIDER_MAX) / 2)   // 544
 
 // ---- The levels ------------------------------------------------------------
@@ -50,12 +57,17 @@
 //     500        ->   44              ->  OFF
 //
 // Boundaries sit midway between the measured points.
-#define DIST_OFF_LOW   77
-#define DIST_LOW_MED  134
-#define DIST_MED_HIGH 184
+// Equal quarters. Half the travel is the furthest the slider can sit from centre,
+// and that distance divides evenly into the four levels — so each level occupies the
+// same width of movement, either side of the middle.
+//
+// These derive from SLIDER_MIN/MAX rather than being fixed numbers, so recalibrating
+// the travel moves the band edges with it and nothing has to be worked out by hand.
+#define HALF_TRAVEL   ((SLIDER_MAX - SLIDER_MIN) / 2)
+#define DIST_OFF_LOW  (HALF_TRAVEL / 4)
+#define DIST_LOW_MED  (HALF_TRAVEL * 2 / 4)
+#define DIST_MED_HIGH (HALF_TRAVEL * 3 / 4)
 
-// A boundary has to be cleared by this much before the level actually changes, so
-// a reading sitting right on a mark cannot flicker between two levels.
 #define BAND_HYSTERESIS 8
 
 // ---- NeoPixel --------------------------------------------------------------
@@ -76,7 +88,7 @@
 // left the slider, and its reflection - so the gesture is yours; the level only says
 // how energetically it comes back.
 //                            Off  Low  Medium  High
-const int SWING_SPEED[4] = {   0,  170,   205,   240 };
+const int SWING_SPEED[4] = {   0,  230,   243,   255 };
 const char* LEVEL_NAME[4] = { "OFF", "LOW", "MEDIUM", "HIGH" };
 
 // Below this the two ends are too close together to be worth swinging between
@@ -86,8 +98,8 @@ const char* LEVEL_NAME[4] = { "OFF", "LOW", "MEDIUM", "HIGH" };
 // as the gap growing. Ease off over the last stretch instead of arriving flat out.
 // The floor is the lowest duty that still reliably breaks friction - not measured,
 // so it is set conservatively high.
-#define RAMP_ZONE 120
-#define MIN_DUTY 190        // measured: 154 was not enough to break friction at all
+#define RAMP_ZONE 60         // only taper close to the target, not half the leg
+#define MIN_DUTY 215        // 154 did not move it at all; 190 still crawled
 
 // Friction varies along the track and between faders, and the duty that actually
 // breaks it has never been measured properly. So rather than trust a guess: if the
@@ -100,9 +112,14 @@ const char* LEVEL_NAME[4] = { "OFF", "LOW", "MEDIUM", "HIGH" };
 #define HOLD_MS 500         // pushing at full boost this long without moving = held
 
 int driveSpeed(int gap, int full) {
+  // Nothing to taper if the level already runs at or below the friction floor — and
+  // tapering anyway inverted the ramp, so the slowest level sped UP as it approached.
+  if (full <= MIN_DUTY) return full;
   if (gap >= RAMP_ZONE) return full;
   int duty = MIN_DUTY + (long)(full - MIN_DUTY) * gap / RAMP_ZONE;
-  return duty < MIN_DUTY ? MIN_DUTY : duty;
+  if (duty < MIN_DUTY) duty = MIN_DUTY;
+  if (duty > full) duty = full;      // a taper must never exceed the cruise speed
+  return duty;
 }
 
 // ---- Control Parameters ----------------------------------------------------
@@ -111,7 +128,7 @@ int driveSpeed(int gap, int full) {
 #define PRINT_INTERVAL 200             // How often to print debug values (ms)
 #define MOVE_TIMEOUT 8000              // Give up on an end rather than push into
                                        // a mechanical stop forever
-#define SAMPLES 8                      // analogRead samples averaged per reading
+#define FADER_SAMPLES 9                      // analogRead samples averaged per reading
 
 // ---- Hand detection --------------------------------------------------------
 // While driving, the slider should get steadily CLOSER to its target. If the gap
@@ -132,7 +149,12 @@ int driveSpeed(int gap, int full) {
 #define GRAB_MARGIN 45      // legacy gap test, kept as a slower backstop
 #define SETTLE_MOVE 8      // Counts of change that still count as "hand moving"
 #define SETTLE_MS 400      // Hand still this long = you let go
-#define CAPTURE_MS 3000    // Longest we keep watching a gesture before acting on it
+
+// ---- Calibration -----------------------------------------------------------
+#define CAL_STILL_DELTA 6      // change that still counts as moving
+#define CAL_STILL_MS 400       // still this long AFTER travelling = at the stop
+#define CAL_NO_MOVE_MS 2000    // never moved at all = we started against it
+#define CAL_TIMEOUT 12000      // ceiling per direction
 
 // Function Declarations
 void motorCoast();
@@ -162,7 +184,6 @@ int boostReported = 0;   // Highest boost we have mentioned, so it is logged onc
 int settleRef = 0;   // Reading the settle timer is measured against
 int handMin = 0;     // How far the hand travelled, while it was on the fader
 int handMax = 0;
-unsigned long captureStart = 0;   // when the current gesture began
 int idleRef = 0;     // Reading we watch for a hand while resting
 
 unsigned long lastPrint = 0;
@@ -176,15 +197,30 @@ const char* statusName() {
   return "SWINGING";
 }
 
-// Average several samples. A single analogRead picks up motor noise, which would
-// otherwise look like movement - or like a hand on the slider. Measured +/-1
-// count at 8 samples, against +/-15 with a single read.
+// Motor noise on the analog line reads as movement, and this wiper also drops out
+// intermittently. Both are handled below.
 int readSlider() {
-  long total = 0;
-  for (int i = 0; i < SAMPLES; i++) {
-    total += analogRead(SLIDER_PIN);
+  // Median, not mean. A mean is dragged by a single bad sample, and this wiper
+  // intermittently drops out — reading 46 or 1023 when the truth is 500. A median
+  // across an odd number of samples discards those outright, however wild they are,
+  // as long as fewer than half the samples are bad.
+  int v[FADER_SAMPLES];
+  for (int i = 0; i < FADER_SAMPLES; i++) v[i] = analogRead(SLIDER_PIN);
+  for (int i = 1; i < FADER_SAMPLES; i++) {        // insertion sort, tiny N
+    int k = v[i], j = i - 1;
+    while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = k;
   }
-  return (int)(total / SAMPLES);
+  int median = v[FADER_SAMPLES / 2];
+
+  // Reject the physically impossible and keep the last good value instead.
+  static int lastGood = -1;
+  if (median < SLIDER_MIN - SLIDER_SLACK || median > SLIDER_MAX + SLIDER_SLACK) {
+    if (lastGood >= 0) return lastGood;
+  } else {
+    lastGood = median;
+  }
+  return median;
 }
 
 // Which level a reading falls in, from its distance either side of centre.
@@ -324,14 +360,84 @@ void swapTarget(int sliderVal) {
   moveStart = millis();
 }
 
+// Every way into GRABBED goes through here. Splitting it across the call sites is
+// what left the idle path with a stale captureStart — so the three second window had
+// already expired before the gesture began, and it acted on the first reading.
+void beginCapture(int sliderVal) {
+  mode = GRABBED;
+  handMin = handMax = sliderVal;
+  settleRef = sliderVal;
+  settleTime = millis();
+}
+
 void handDetected(int sliderVal) {
   Serial.println("HAND DETECTED - motor released, set it where you like");
   motorCoast();
-  mode = GRABBED;
-  handMin = handMax = sliderVal;   // start measuring the gesture from here
-  captureStart = millis();
-  settleRef = sliderVal;
-  settleTime = millis();
+  beginCapture(sliderVal);
+}
+
+// Drive one way until the reading stops changing, and report where it stopped.
+// Stillness alone is not enough: at the start the motor has not spun up, so the
+// slider is legitimately still for a moment. Only count it once it has actually
+// travelled — otherwise calibration ends instantly at the starting position.
+int findStop(int dir) {
+  unsigned long start = millis(), lastMove = millis();
+  int ref = readSlider();
+  bool moved = false;
+
+  while (millis() - start < CAL_TIMEOUT) {
+    if (dir > 0) motorForward(255); else motorBackward(255);
+    int v = readSlider();
+    if (abs(v - ref) > CAL_STILL_DELTA) { ref = v; lastMove = millis(); moved = true; }
+    else if (moved && millis() - lastMove >= CAL_STILL_MS) break;
+    else if (!moved && millis() - start >= CAL_NO_MOVE_MS) break;
+  }
+  motorCoast();
+  delayMicroseconds(1);
+  return readSlider();
+}
+
+void calibrate() {
+  Serial.println();
+  Serial.println("=== CALIBRATING - hands off ===");
+  int lo = findStop(-1);
+  int hi = findStop(+1);
+  if (lo > hi) { int t = lo; lo = hi; hi = t; }
+
+  Serial.print("  measured travel  "); Serial.print(lo);
+  Serial.print(" - "); Serial.println(hi);
+  Serial.print("  span             "); Serial.println(hi - lo);
+  int c = (lo + hi) / 2;
+  Serial.print("  centre           "); Serial.println(c);
+  Serial.println("  paste into the sketch:");
+  Serial.print("    #define SLIDER_MIN "); Serial.println(lo);
+  Serial.print("    #define SLIDER_MAX "); Serial.println(hi);
+  Serial.println("  band edges that follow:");
+  const int e[3] = { DIST_OFF_LOW, DIST_LOW_MED, DIST_MED_HIGH };
+  const char *n[4] = { "OFF", "LOW", "MEDIUM", "HIGH" };
+  for (int i = 0; i < 4; i++) {
+    int dLo = (i == 0) ? 0 : e[i - 1];
+    int dHi = (i == 3) ? (hi - c) : e[i];
+    Serial.print("    "); Serial.print(n[i]); Serial.print("\t");
+    if (i == 0) { Serial.print(c - dHi); Serial.print(" - "); Serial.println(c + dHi); }
+    else {
+      Serial.print(c - dHi); Serial.print(" - "); Serial.print(c - dLo);
+      Serial.print("   and   "); Serial.print(c + dLo);
+      Serial.print(" - "); Serial.println(c + dHi);
+    }
+  }
+  Serial.println("===============================");
+  Serial.println();
+  moveStart = millis();
+  mode = HOMING;
+}
+
+// A single character is enough: 'c' calibrates.
+void readSerial() {
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == 'c' || ch == 'C') calibrate();
+  }
 }
 
 void setup() {
@@ -379,6 +485,8 @@ void setup() {
 }
 
 void loop() {
+  readSerial();
+
   int sliderVal = readSlider();
 
   // The strip shows the level you SET, and holds it.
@@ -454,9 +562,7 @@ void loop() {
       motorCoast();
       if (abs(sliderVal - idleRef) > SETTLE_MOVE) {
         Serial.println("HAND DETECTED - set it where you like");
-        mode = GRABBED;
-        settleRef = sliderVal;
-        settleTime = millis();
+        beginCapture(sliderVal);
       }
       break;
     }
@@ -468,14 +574,6 @@ void loop() {
       // reached are what the fader will ping-pong between.
       if (sliderVal < handMin) handMin = sliderVal;
       if (sliderVal > handMax) handMax = sliderVal;
-      // Three seconds is as long as we watch. Keep moving past that and it acts on
-      // where the fader is right then, rather than waiting for you to stop.
-      if (millis() - captureStart >= CAPTURE_MS) {
-        Serial.println("  (3s capture window closed)");
-        detectFrom(sliderVal);
-        break;
-      }
-
       if (abs(sliderVal - settleRef) > SETTLE_MOVE) {
         settleRef = sliderVal;
         settleTime = millis();
