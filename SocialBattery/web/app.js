@@ -126,7 +126,7 @@ const isArmLive = (i) =>
   : i === POT_ARM;
 
 // ---------------------------------------------------------------- serial
-let port = null, writer = null, reader = null, pipeClosed = null, readAbort = false;
+let port = null, writer = null, reader = null, readAbort = false;
 let connecting = false;
 let rxBuffer = "";
 let helloResolve = null;
@@ -203,8 +203,10 @@ async function connect({ auto = false } = {}) {
 
   try {
     let target = await findKnownPort();
+    let pickedByHand = false;
 
     if (!target) {
+      pickedByHand = true;
       if (auto) return;               // nothing permitted yet — stay quiet, keep watching
       log("no board has been granted to this page yet — pick it once and I'll remember it");
       target = await navigator.serial.requestPort({ filters: PORT_FILTERS });
@@ -223,7 +225,31 @@ async function connect({ auto = false } = {}) {
     readLoop();
     setConnUI("checking");
 
-    const hello = await handshake();
+    let hello = await handshake();
+
+    // A remembered port can go stale: unplug and replug and the board comes back on a
+    // different one, while the old grant lingers in the browser. Opening that gets
+    // silence — so if a port we chose ourselves does not answer, fall back to asking,
+    // rather than reporting "no answer" about a port that is not even the board.
+    if (!hello && !auto && !pickedByHand) {
+      log("that port did not answer — it may be a stale one. Asking you to pick.", "warn");
+      connecting = false;
+      await disconnect({ quiet: true, keepAuto: true });
+      try {
+        port = await navigator.serial.requestPort({ filters: PORT_FILTERS });
+        connecting = true;
+        await port.open({ baudRate: 115200 });
+        writer = port.writable.getWriter();
+        readLoop();
+        setConnUI("checking");
+        hello = await handshake();
+      } catch (err) {
+        log("connect cancelled: " + err.message, "err");
+        await disconnect({ quiet: true, keepAuto: true });
+        return;
+      }
+    }
+
     if (!hello) {
       log("no answer from that port — nothing identified itself as the board.", "err");
       log("check: sketch uploaded? Serial Monitor closed? right port picked?", "err");
@@ -268,13 +294,13 @@ async function disconnect({ quiet = false, keepAuto = false } = {}) {
     Promise.race([promise, new Promise((r) => setTimeout(r, ms))]);
 
   try { if (state.connected && writer) send("X"); } catch { /* best effort */ }
-  try { if (reader) await limit(reader.cancel(), 500); } catch { /* already gone */ }
-  try { if (pipeClosed) await limit(pipeClosed, 500); } catch { /* aborted, expected */ }
+  try { if (reader) { await limit(reader.cancel(), 500); reader.releaseLock(); } }
+  catch { /* the read loop's finally will have freed it */ }
+  reader = null;
   try { if (writer) writer.releaseLock(); } catch { /* already released */ }
   writer = null;
   try { if (port) await limit(port.close(), 1000); } catch (err) { log("close: " + err.message, "err"); }
   port = null;
-  pipeClosed = null;
 
   state.connected = false;
   state.hasArmTelemetry = false;
@@ -286,16 +312,20 @@ async function disconnect({ quiet = false, keepAuto = false } = {}) {
 
 async function readLoop() {
   readAbort = false;
-  const decoder = new TextDecoderStream();
-  // Keep both handles: port.readable stays locked by this pipe until it is cancelled,
-  // and port.close() throws while anything holds a lock on it.
-  pipeClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
-  reader = decoder.readable.getReader();
+
+  // Read port.readable directly and decode by hand, rather than piping it through a
+  // TextDecoderStream. pipeTo() takes a lock on port.readable that cancelling the
+  // decoder's reader does not reliably release — and while that lock is held,
+  // port.close() throws "Cannot cancel a locked stream". The port then stays open
+  // with no way back except closing the tab, which is exactly what kept happening.
+  // Holding the reader ourselves means cancel() + releaseLock() always frees it.
+  const decoder = new TextDecoder();
+  reader = port.readable.getReader();
   try {
     while (!readAbort) {
       const { value, done } = await reader.read();
       if (done) break;
-      rxBuffer += value;
+      rxBuffer += decoder.decode(value, { stream: true });
       let i;
       while ((i = rxBuffer.indexOf("\n")) >= 0) {
         handleLine(rxBuffer.slice(0, i).trim());

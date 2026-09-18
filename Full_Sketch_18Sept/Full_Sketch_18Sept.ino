@@ -98,9 +98,9 @@ const char *STATE_NAME[STATE_COUNT] = { "LOW", "MED", "HIGH" };
 // Equal quarters, the same division the fader uses. ARM_REACH is how far an arm can
 // swing either side of centre; Low/Medium/High take two, three and four quarters of
 // it, so each step up widens the swing by the same amount.
-#define ARM_REACH 40.0
+#define ARM_REACH 30.0
 float stateAmp[STATE_COUNT]  = { ARM_REACH * 0.50, ARM_REACH * 0.75, ARM_REACH };
-float stateRate[STATE_COUNT] = { 0.35,  0.90,  1.10 };  // radians per second
+float stateRate[STATE_COUNT] = { 0.18,  0.45,  0.60 };  // radians per second
 
 // Seconds to cross from one state's amplitude/speed to another's. A state change is a
 // mood change, not a switch — it should be readable as it happens.
