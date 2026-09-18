@@ -34,15 +34,16 @@
 #define SLIDER_PIN A1  // Analog input from slider's feedback potentiometer
 
 // ---- Travel limits, measured on the bench ----------------------------------
-#define SLIDER_MIN 255      // low stop, measured by hand with the motor off
-#define SLIDER_MAX 825      // high stop, measured by hand with the motor off
+#define SLIDER_MIN 199      // low stop, measured by hand with the motor idle
+#define SLIDER_MAX 877      // high stop, measured by hand with the motor idle
 
 // How far outside that travel a reading may sit before it is treated as noise. The
 // motor throws a lot of electrical rubbish onto the analog line, and the readings it
 // produces are not near-misses — they are 0 and 1023, the rails, which the slider
 // cannot physically reach. Anything out here is discarded and the last good reading
 // stands. This is what was making HIGH glitch: that is when the motor works hardest.
-#define SLIDER_SLACK 40
+#define RAIL_LOW 8         // at or below this the input has floated, not moved
+#define RAIL_HIGH 1015
 #define SLIDER_CENTER ((SLIDER_MIN + SLIDER_MAX) / 2)   // 544
 
 // ---- The levels ------------------------------------------------------------
@@ -93,6 +94,12 @@ const char* LEVEL_NAME[4] = { "OFF", "LOW", "MEDIUM", "HIGH" };
 
 // Below this the two ends are too close together to be worth swinging between
 #define MIN_SWING 60
+
+// A level change needs evidence that a hand actually moved the fader. Without this,
+// any re-capture re-levels — and a stalled swing near an end triggers exactly that,
+// re-capturing at whatever extreme it stalled at and promoting the level to HIGH.
+// Set MEDIUM, watch it stall at the top, and it silently becomes HIGH.
+#define MIN_GESTURE 25
 
 // Overshoot control. At full duty the fader sails past the target, which then reads
 // as the gap growing. Ease off over the last stretch instead of arriving flat out.
@@ -213,9 +220,15 @@ int readSlider() {
   }
   int median = v[FADER_SAMPLES / 2];
 
-  // Reject the physically impossible and keep the last good value instead.
+  // Reject the rails and keep the last good value instead.
+  //
+  // Deliberately NOT a window around the declared travel: that would prejudge the
+  // answer and make it impossible to calibrate a range wider than the one already
+  // written down. The rails are the only readings that are impossible on their own
+  // terms — a wiper sitting on a live divider cannot reach either supply exactly, so
+  // 0 and 1023 mean the input floated, which is what the motor's noise does to it.
   static int lastGood = -1;
-  if (median < SLIDER_MIN - SLIDER_SLACK || median > SLIDER_MAX + SLIDER_SLACK) {
+  if (median <= RAIL_LOW || median >= RAIL_HIGH) {
     if (lastGood >= 0) return lastGood;
   } else {
     lastGood = median;
@@ -289,7 +302,15 @@ void detectFrom(int x) {
   pointA = constrain(x, SLIDER_MIN, SLIDER_MAX);
   pointB = constrain(SLIDER_MIN + SLIDER_MAX - pointA, SLIDER_MIN, SLIDER_MAX);
 
-  level = levelFor(pointA, level);
+  // Only re-level on a real gesture. A span of a few counts is the swing stalling and
+  // being mistaken for a hand, not you choosing something new — keep the level you set.
+  if (span >= MIN_GESTURE) {
+    level = levelFor(pointA, level);
+  } else {
+    Serial.print("  (span ");
+    Serial.print(span);
+    Serial.println(" — too small to be a gesture, keeping the level)");
+  }
 
   Serial.print("DETECTED value ");
   Serial.print(pointA);

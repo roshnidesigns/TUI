@@ -18,9 +18,9 @@ const ANGLE_MIN = 10, ANGLE_MAX = 170;
 // Labels for the arm rows. The pin list must match SERVO_PIN[] in the sketch.
 // Arms are identified by colour, not by index — that's what's visible on the object.
 const ARM_PINS  = ["D2", "D3", "—"];
-const ARM_COLOR = ["Blue", "Yellow", "Red"];
-const ARM_SHAPE = ["square", "wedge", "octagon"];
-const ARM_CLASS = ["blue", "yellow", "red"];
+const ARM_COLOR = ["Blue", "Orange", "Yellow"];
+const ARM_SHAPE = ["triangle", "ring", "gourd"];
+const ARM_CLASS = ["blue", "orange", "yellow"];
 
 // Red's level comes from a potentiometer wired straight to the board (see POT_PIN in
 // the sketch) — it's the dial's alone to set. The board itself rejects T/X commands
@@ -91,7 +91,10 @@ const statePhase = { LOW: 0, MED: 0, HIGH: 0 };
 // so rotation is measured from CENTER_ANGLE: each arm swings about its own socket,
 // in its own direction, opening the fan wider as the angle rises.
 const VIS_SCALE = 1.0;
-const VIS_DIR   = [1.0, 1.0, 1.0];
+// Each arm swings in its own direction on screen. With all three the same they
+// rotate identically and, being drawn from nearly the same pivot, lie exactly on top
+// of one another — which is what made the preview collapse to a single rod.
+const VIS_DIR   = [1.0, -0.9, 0.45];
 const PIVOT     = [[203, 462], [210, 468], [217, 472]];  // back, middle, front
 
 // ---------------------------------------------------------------- state
@@ -123,7 +126,7 @@ const isArmLive = (i) =>
   : i === POT_ARM;
 
 // ---------------------------------------------------------------- serial
-let port = null, writer = null, readAbort = false;
+let port = null, writer = null, reader = null, pipeClosed = null, readAbort = false;
 let connecting = false;
 let rxBuffer = "";
 let helloResolve = null;
@@ -209,6 +212,10 @@ async function connect({ auto = false } = {}) {
       log("found a previously granted Arduino — opening it without asking");
     }
 
+    // A port we already hold is already open; opening it again throws and leaves the
+    // page unable to connect until it is reloaded.
+    if (port) await disconnect({ quiet: true, keepAuto: true });
+
     connecting = true;
     port = target;
     await port.open({ baudRate: 115200 });
@@ -239,21 +246,39 @@ async function connect({ auto = false } = {}) {
     // An auto attempt failing is normal — the board may be mid-reboot after a flash.
     if (!auto || !/No port selected/i.test(err.message)) log("connect failed: " + err.message, "err");
     await disconnect({ quiet: true, keepAuto: true });
+  } finally {
+    // Whatever happened, never leave the button stuck mid-check.
+    connecting = false;
+    if (!state.connected) setConnUI(false);
   }
 }
 
 async function disconnect({ quiet = false, keepAuto = false } = {}) {
   if (!keepAuto) userDisconnected = true;
-  try {
-    if (state.connected && writer) send("X");   // leave the object at rest, not mid-swing
-    readAbort = true;
-    if (writer) { await writer.ready.catch(() => {}); writer.releaseLock(); writer = null; }
-    if (port) { await port.close(); port = null; }
-  } catch (err) {
-    log("disconnect: " + err.message, "err");
-  }
+  readAbort = true;
+
+  // Order matters, and each step has to survive the one before it failing — a half
+  // torn-down port is worse than none, because the next connect() then finds it
+  // already open and there is no way back without reloading the page.
+  // Every await here can hang: a cancelled pipe does not always settle, and closing a
+  // port the device stopped answering can block indefinitely. A disconnect that never
+  // returns leaves the UI stuck on "Checking…" with the button disabled and no way
+  // back except reloading, so none of these is allowed to wait forever.
+  const limit = (promise, ms) =>
+    Promise.race([promise, new Promise((r) => setTimeout(r, ms))]);
+
+  try { if (state.connected && writer) send("X"); } catch { /* best effort */ }
+  try { if (reader) await limit(reader.cancel(), 500); } catch { /* already gone */ }
+  try { if (pipeClosed) await limit(pipeClosed, 500); } catch { /* aborted, expected */ }
+  try { if (writer) writer.releaseLock(); } catch { /* already released */ }
+  writer = null;
+  try { if (port) await limit(port.close(), 1000); } catch (err) { log("close: " + err.message, "err"); }
+  port = null;
+  pipeClosed = null;
+
   state.connected = false;
   state.hasArmTelemetry = false;
+  connecting = false;
   setConnUI(false);
   paintState();
   if (!quiet) log("disconnected");
@@ -262,8 +287,10 @@ async function disconnect({ quiet = false, keepAuto = false } = {}) {
 async function readLoop() {
   readAbort = false;
   const decoder = new TextDecoderStream();
-  const closed = port.readable.pipeTo(decoder.writable).catch(() => {});
-  const reader = decoder.readable.getReader();
+  // Keep both handles: port.readable stays locked by this pipe until it is cancelled,
+  // and port.close() throws while anything holds a lock on it.
+  pipeClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
+  reader = decoder.readable.getReader();
   try {
     while (!readAbort) {
       const { value, done } = await reader.read();
@@ -276,46 +303,11 @@ async function readLoop() {
       }
     }
   } catch (err) {
-    log("read error: " + err.message, "err");
+    if (!readAbort) log("read error: " + err.message, "err");
   } finally {
-    reader.releaseLock();
-    await closed;
+    try { reader.releaseLock(); } catch { /* already released */ }
+    reader = null;
   }
-}
-
-/* The fader sketch speaks plain English rather than the old protocol — it is what
- * you read in the Serial Monitor at the bench, and teaching the page to read the
- * same thing means the sketch never has to change shape to suit the browser.
- *
- * Two lines carry everything:
- *   t=12.345s  SWINGING  slider: 751  level: HIGH  target: 660
- *   DETECTED x = 712  ->  MODE HIGH  swinging 712 <-> 338  at speed 240
- */
-const FADER_STATUS = /^t=[\d.]+s\s+(\w+)\s+slider:\s*(\d+)\s+level:\s*(\w+)/;
-const FADER_DETECT = /MODE\s+(\w+)\s+swinging\s+(\d+)\s*<->\s*(\d+)/;
-const FADER_LEVEL_TO_STATE = { OFF: null, LOW: "LOW", MEDIUM: "MED", HIGH: "HIGH" };
-
-function applyFader({ phase, slider, level, swingLo, swingHi }) {
-  const a = arms[POT_ARM];
-
-  if (phase !== undefined) fader.phase = phase;
-  if (slider !== undefined) { fader.slider = slider; potValue = slider; }
-  if (swingLo !== undefined) { fader.swingLo = swingLo; fader.swingHi = swingHi; }
-
-  if (level !== undefined) {
-    fader.level = level;
-    const st = FADER_LEVEL_TO_STATE[level];
-    potBand = ["OFF", "LOW", "MEDIUM", "HIGH"].indexOf(level);
-    if (st) {
-      // the fader is mid-gesture, so let the arm keep its phase and just retune it
-      if (!a.running) { a.phase = 0; a.amp = STATES[st].amp; }
-      a.name = st;
-      a.running = true;
-    } else {
-      a.running = false;
-    }
-  }
-  paintState();
 }
 
 function handleLine(line) {

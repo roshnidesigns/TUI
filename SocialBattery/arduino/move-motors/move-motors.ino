@@ -92,7 +92,19 @@
 //
 // Set to 1 to bring the servo arms back. With them off, no pulses are ever sent and
 // the servos draw nothing — which leaves the whole supply for the fader motor.
-#define SERVOS_ENABLED 0
+#define SERVOS_ENABLED 1
+
+// Release a stopped arm once it has settled, instead of holding it there.
+//
+// Holding torque at idle keeps the arm rigidly on CENTER_ANGLE, which is what the
+// object's "vertical at rest" look depends on — but it means a stopped servo is
+// pushing continuously, and if the arm is fighting anything mechanical that is a
+// permanent stall: full current, no movement, all of it heat. A servo that gets hot
+// while doing nothing is telling you it cannot reach where it is being sent.
+//
+// Set to 1 to go back to holding.
+#define HOLD_AT_REST 0
+#define RELEASE_AFTER_MS 900   // settle time before letting go
 
 const uint8_t SERVO_PIN[] = { 2, 3 };
 //
@@ -116,7 +128,11 @@ const uint8_t LED_PIN   = LED_BUILTIN;   // pin 6 on the MKR boards
 
 // Resting pose — the middle of each arm's swing. State changes how an arm MOVES, not
 // where it sits. Three entries, so the others are ready when you add them.
-const int CENTER_ANGLE[MAX_ARMS] = { 60, 96, 93 };
+// Arm 1 is confirmed vertical at 96 on the real object. Arm 0 was inherited at 60,
+// which put HIGH's sweep at 20-100 degrees — far enough down that the linkage stalled
+// against its stop and the servo cooked. Starting it at the known-good 96 until it is
+// measured; use C:<arm>:<angle> to find the true vertical and paste it back here.
+const int CENTER_ANGLE[MAX_ARMS] = { 96, 96, 93 };
 
 // Hard clamp on every movement. Keep inside whatever the linkage can physically reach.
 const int ANGLE_MIN = 10;
@@ -131,7 +147,11 @@ const char *STATE_NAME[STATE_COUNT] = { "LOW", "MED", "HIGH" };
 //                                          LOW    MED    HIGH
 // Live-tunable so a state can be dialled in against the real object without a
 // re-upload — see the V: command. Whatever you settle on, paste it back here.
-float stateAmp[STATE_COUNT]  = { 10.0,  20.0,  35.0 };  // degrees either side of centre
+// Equal quarters, the same division the fader uses. ARM_REACH is how far an arm can
+// swing either side of centre; Low/Medium/High take two, three and four quarters of
+// it, so each step up widens the swing by the same amount.
+#define ARM_REACH 40.0
+float stateAmp[STATE_COUNT]  = { ARM_REACH * 0.50, ARM_REACH * 0.75, ARM_REACH };
 float stateRate[STATE_COUNT] = { 0.35,  0.90,  1.10 };  // radians per second
 
 // Seconds to cross from one state's amplitude/speed to another's. A state change is a
@@ -153,7 +173,8 @@ bool  servosAttached[MAX_ARMS] = { false, false, false };
 // Everything below is per arm.
 State armState[MAX_ARMS]   = { ST_MED, ST_MED, ST_MED };
 bool  armRunning[MAX_ARMS] = { false, false, false };
-float armAngle[MAX_ARMS];       // what the servo is actually holding
+float armAngle[MAX_ARMS];
+unsigned long restSince[MAX_ARMS] = { 0, 0, 0 };   // when an arm arrived at rest       // what the servo is actually holding
 float armAmp[MAX_ARMS]  = { 0, 0, 0 };   // smoothed toward the state's amplitude
 
 // One shared phase clock per STATE, not per arm — every arm currently in a given
@@ -289,8 +310,20 @@ void updateArms(float dt) {
     float wantAmp = moving ? stateAmp[s] : 0.0;   // stopping fades the swing out
     armAmp[i] += (wantAmp - armAmp[i]) * k;
 
+    // Ping-pong, not a sine — the same shape the fader makes. A sine spends most of
+    // its time near the ends and eases through the middle; a ping-pong crosses at a
+    // constant rate and turns sharply, which is what the motorized fader physically
+    // does and what makes the two read as one object.
+    //
+    // A triangle wave from the state's shared clock: phase runs 0..2PI as before, the
+    // first half sweeping one way and the second half back.
+    float cycle = fmod(statePhase[s], TWO_PI);
+    if (cycle < 0) cycle += TWO_PI;
+    float tri = (cycle < PI) ? (cycle / PI) * 2.0 - 1.0     // -1 -> +1
+                             : 1.0 - ((cycle - PI) / PI) * 2.0;  // +1 -> -1
+
     float target = moving
-      ? CENTER_ANGLE[i] + sin(statePhase[s]) * armAmp[i]
+      ? CENTER_ANGLE[i] + tri * armAmp[i]
       : CENTER_ANGLE[i];
     target = clampf(target, ANGLE_MIN, ANGLE_MAX);
 
@@ -301,6 +334,15 @@ void updateArms(float dt) {
     armAngle[i] += delta;
 
     if (servosAttached[i]) servos[i].write((int)(armAngle[i] + 0.5));
+
+    // Once a stopped arm has arrived, let it go — nothing to hold it against.
+    if (!HOLD_AT_REST && !armRunning[i] && servosAttached[i]
+        && fabs(armAngle[i] - CENTER_ANGLE[i]) <= 1.0) {
+      if (restSince[i] == 0) restSince[i] = millis();
+      else if (millis() - restSince[i] >= RELEASE_AFTER_MS) attachArm(i, false);
+    } else if (armRunning[i]) {
+      restSince[i] = 0;
+    }
 
     // Deliberately never auto-releases at rest. A released servo goes limp, and
     // gravity pulls the arm's own weight off CENTER_ANGLE — exactly the "vertical at
@@ -927,6 +969,27 @@ void handleLine(char *s) {
     if (st >= STATE_COUNT) { Serial.println(F("ERR:unknown state")); return; }
     startAll((State)st);
     Serial.print(F("OK:T all ")); Serial.println(STATE_NAME[st]);
+    return;
+  }
+
+  // C:<arm>:<angle> — hold one arm at an angle, so the resting vertical can be found
+  // by eye rather than guessed. It stays there until you stop it or set a state.
+  if (kind == 'C' && s[1] == ':') {
+    char *p1 = strchr(s + 2, ':');
+    if (!p1) { Serial.println(F("ERR:C needs arm and angle")); return; }
+    *p1 = '\0';
+    int idx = atoi(s + 2);
+    int ang = atoi(p1 + 1);
+    if (idx < 0 || idx >= ARM_COUNT) { Serial.println(F("ERR:arm out of range")); return; }
+    ang = (int)clampf(ang, ANGLE_MIN, ANGLE_MAX);
+    takeControl();
+    armRunning[idx] = false;
+    restSince[idx] = 0;
+    attachArm(idx, true);
+    armAngle[idx] = ang;
+    servos[idx].write(ang);
+    Serial.print(F("OK:C ")); Serial.print(idx);
+    Serial.print(F(" holding ")); Serial.println(ang);
     return;
   }
 
