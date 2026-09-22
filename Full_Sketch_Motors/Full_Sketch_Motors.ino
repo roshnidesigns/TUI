@@ -399,13 +399,17 @@ void updateArms(float dt) {
 #define BAND_HYSTERESIS 8   // a reading must clear a boundary by this much to change level
 
 // ---- NeoPixel --------------------------------------------------------------
-// 24-pixel ring, six ever lit as one arc growing outward from its middle - two at
-// Low, four at Medium, six at High. Change LED_SLOT to move which six pixels light.
-#define STRIP_COUNT 24        // the whole ring; only six of them are ever lit
+// 8-pixel strip. The lit fill grows OUTWARD from the middle pair as the faderLevel
+// rises, so it reads as the battery opening up - each level keeps everything the one
+// below it lit.
+//     off      nothing
+//     low      4,5              the middle pair
+//     medium   3,4,5,6          widening
+//     high     1,2,3,4,5,6,7,8  the whole strip
+// Bit 0 is pixel 1, so the masks below read right-to-left.
+#define STRIP_COUNT 8
 #define STRIP_BRIGHTNESS 90
-const uint8_t LED_USED = 6;                                    // how many of the 24 pixels are ever lit
-const uint8_t LED_SLOT[LED_USED] = { 5, 6, 7, 8, 9, 10 };       // which physical pixel indices those six are
-const uint8_t LED_LIT[4] = { 0, 2, 4, 6 };                      // pixels lit, indexed by level
+const uint8_t STRIP_MASK[4] = { 0b00000000, 0b00011000, 0b00111100, 0b11111111 };   // which pixels light, indexed by level
 
 // How hard each faderLevel is driven. The swing's ENDS come from the mirror - where you
 // left the slider, and its reflection - so the gesture is yours; the faderLevel only says
@@ -587,21 +591,18 @@ const uint32_t STRIP_COLOUR[4] = {
 
 int shownLevel = -1;   // so the strip is only rewritten when it actually changes
 
-// Redraws the ring only when the level has actually changed, growing the lit arc
-// outward from its middle so it never blinks or flickers between calls.
+// Redraws the strip only when the level has actually changed, so it never blinks or
+// flickers between calls.
 void showLevel(int lv) {
   if (lv == shownLevel) return;    // nothing changed - leave the strip alone
   shownLevel = lv;                 // remember what is now showing
 
+  uint8_t mask = STRIP_MASK[lv];   // which of the 8 pixels light at this level
   uint32_t c = STRIP_COLOUR[lv];   // colour for this level
-  uint8_t lit = LED_LIT[lv];       // how many of the six pixels should be on
-  uint8_t first = (LED_USED - lit) / 2;    // grow outward from the middle of the six
-
-  strip.clear();                            // the other eighteen stay dark
-  for (uint8_t k = 0; k < LED_USED; k++) {
-    if (k >= first && k < first + lit) strip.setPixelColor(LED_SLOT[k], c);   // light this one of the six
+  for (uint8_t i = 0; i < STRIP_COUNT; i++) {
+    strip.setPixelColor(i, (mask & (1 << i)) ? c : 0);
   }
-  strip.show();   // push the buffer to the physical ring
+  strip.show();   // push the buffer to the physical strip
 }
 
 // Returns 4 if the name is not one of OFF/LOW/MEDIUM/HIGH.
