@@ -64,6 +64,8 @@
  *   V                  print the live amplitude/speed table
  *   V:<state>:<amp>:<rate>   retune a level without re-uploading
  *   k                  calibrate the fader's travel
+ *   F:<level>          paced swing at that level, timed to match the arms, e.g. F:HIGH
+ *   F:<value>          flat-out to an exact raw slider position instead, e.g. F:700
  *   1 / 2 / 3 / 0      all arms to low / medium / high / stop
  *   a                  start the standalone demo cycle
  *   c                  hold every arm at CENTER_ANGLE
@@ -172,7 +174,7 @@ const char *STATE_NAME[STATE_COUNT] = { "LOW", "MED", "HIGH" };        // for se
 // Set directly per level rather than derived from a single reach number - MED and
 // HIGH were both pulled in from their original quarter-division on request, tested
 // live via V:<state>:<amp>:<rate> against the real object before committing here.
-float stateAmp[STATE_COUNT]  = { 15.0, 35.0, 50.0 };   // degrees either side of centre, per state
+float stateAmp[STATE_COUNT]  = { 10.0, 25.0, 45.0 };   // degrees either side of centre, per state
 float stateRate[STATE_COUNT] = { 0.18,  0.45,  0.60 };  // radians per second
 
 // Seconds to cross from one state's amplitude/speed to another's. A state change is a
@@ -419,8 +421,14 @@ void updateArms(float dt) {
 #define STRIP_PIN 1    // NeoPixel data
 
 // ---- Travel limits, measured on the bench ----------------------------------
-#define SLIDER_MIN 199      // low stop, measured by hand with the motor idle
-#define SLIDER_MAX 877      // high stop, measured by hand with the motor idle
+// The k calibration command found the true mechanical stops at 11/1007. Full-speed
+// swings out toward those stops stalled and mis-triggered false hand-detections -
+// even mid-travel, nowhere near either end, so this is likely a stall/pushback
+// detection bug (see REVERSE_MARGIN) rather than something range alone fixes. Pulled
+// in to a plain 200/800 for now; revisit the detection logic separately. Shifted by
+// +7 to centre on 507 (measured physical centre), same 600-count span.
+#define SLIDER_MIN 207
+#define SLIDER_MAX 807
 
 // How far outside that travel a reading may sit before it is treated as noise. The
 // motor throws a lot of electrical rubbish onto the analog line, and the readings it
@@ -430,6 +438,19 @@ void updateArms(float dt) {
 #define RAIL_LOW 8         // at or below this the input has floated, not moved
 #define RAIL_HIGH 1015     // at or above this the input has floated, not moved
 #define SLIDER_CENTER ((SLIDER_MIN + SLIDER_MAX) / 2)   // 544 - midpoint of travel, the OFF mark
+
+// The rail rejection above only catches noise that lands on 0 or 1023 - the motor
+// also throws noise that lands mid-range, worst right when a direction changes
+// (motorStop() then reversing, in swapTarget() and detectFrom()). That transient
+// outlasts a handful of loop passes, so counting calls was not a long enough memory
+// to ride it out - it is timed instead. For SLIDER_BLANK_MS after either of those
+// functions runs, a reading further than SLIDER_JUMP_MAX from the last good one is
+// distrusted and the last good value stands. Past that window, every reading is
+// trusted again, same as before. This is what was letting a noise spike register as
+// "arrived" mid-swing and immediately swap direction, or as sustained pushback and
+// fire a false hand-detect.
+#define SLIDER_JUMP_MAX 40    // counts further than this from lastGood = suspect, within the window
+#define SLIDER_BLANK_MS 80    // how long after a direction change to distrust a big jump
 
 // ---- The levels ------------------------------------------------------------
 // The faderLevel is how far the slider sits FROM THE CENTRE, in either direction - so
@@ -527,8 +548,14 @@ int driveSpeed(int gap, int full) {
 // instead grows by more than this, something is pushing back - you.
 // Catching a hand while the motor is driving.
 //
-#define GRACE_MS 150        // ignore direction right after a turn
-#define REVERSE_MARGIN 12   // counts moved against the drive = a hand
+// Widened from 150/12 - a hard brake-and-reverse at MEDIUM/HIGH speed was coasting or
+// overshooting past REVERSE_MARGIN before GRACE_MS had even elapsed, real mechanical
+// settling misread as a hand pushing back. A genuine hand push still clears this
+// margin easily and keeps pushing well past GRACE_MS, so real hand detection should
+// not be meaningfully slower - only the false trigger right after a reversal should
+// go away. Revisit if a real hand now goes uncaught.
+#define GRACE_MS 350        // ignore direction right after a turn
+#define REVERSE_MARGIN 30   // counts moved against the drive = a hand
 #define SETTLE_MOVE 8      // Counts of change that still count as "hand moving"
 #define SETTLE_MS 400      // Hand still this long = you let go
 
@@ -550,11 +577,27 @@ int pointA = 0;      // low end of the current swing
 int pointB = 0;      // high end
 int targetVal = 0;   // whichever end we are heading for right now
 
-enum FaderMode { FD_HOMING, FD_SWINGING, FD_GRABBED, FD_IDLE };   // FD_HOMING: driving to centre at boot
-                                                                   // FD_SWINGING: motor ping-ponging pointA<->pointB
+enum FaderMode { FD_HOMING, FD_SWINGING, FD_GRABBED, FD_IDLE, FD_PACED };  // FD_HOMING: driving to centre at boot
+                                                                   // FD_SWINGING: motor flat-out toward pointA/pointB
                                                                    // FD_GRABBED: motor off, a hand is moving the slider
                                                                    // FD_IDLE: motor off, resting at OFF
+                                                                   // FD_PACED: tracking a smoothly ping-ponging target,
+                                                                   //   timed to match a chosen seconds-per-swing
 FaderMode faderMode = FD_HOMING;   // start every power-up by driving to the centre mark
+
+// ---- Paced swing (F:<level>) - speed-matched to the arms' own timing ------------
+// The arms swing at LOW/MED/HIGH = 35/14/10.5 seconds per there-and-back (see
+// stateRate near the top of the sketch). The fader's motor has no such control: at
+// any duty that overcomes friction it crosses its whole short travel in well under a
+// second, so matching the arms means pacing the TARGET itself - moving it smoothly
+// between the two ends on the arms' own triangle-wave schedule - and only nudging the
+// motor to chase that slowly-moving point, rather than driving flat-out to a fixed
+// endpoint and swapping on arrival (which is what FD_SWINGING still does, e.g. for a
+// real hand-release gesture, where matching the arms does not apply).
+const float PACE_SECONDS[4] = { 0.0, 35.0, 14.0, 10.5 };   // OFF unused, LOW/MED/HIGH - same table as the arms
+#define PACE_DEADBAND 15    // how close to the live target counts as "there" - coast inside it
+float pacePhase = 0;                // radians, this swing's own clock, wraps via fmod
+unsigned long paceLastTick = 0;     // millis() timestamp of the last FD_PACED update, for dt
 
 int bestGap = 0;     // Closest we have got to the target on this leg
 int legStartGap = 0; // Gap when this leg began
@@ -575,12 +618,14 @@ int lastPrintedFaderMode  = -1;   // so the fader status line only prints on a r
 int lastPrintedFaderLevel = -1;
 unsigned long moveStart = 0;        // millis() timestamp this HOMING/SWINGING leg began, for timeouts
 unsigned long settleTime = 0;       // millis() timestamp the hand last moved, for the let-go check
+unsigned long noiseBlankUntil = 0;  // readSlider() distrusts implausible jumps until this millis() timestamp
 
 // Human-readable name of the fader's current mode, for the status line.
 const char* faderPhaseName() {
   if (faderMode == FD_HOMING)  return "FD_HOMING  ";
   if (faderMode == FD_IDLE)    return "RESTING ";
   if (faderMode == FD_GRABBED) return "HAND    ";
+  if (faderMode == FD_PACED)   return "FD_PACED";
   return "FD_SWINGING";
 }
 
@@ -610,6 +655,9 @@ int readSlider() {
   static int lastGood = -1;                          // persists between calls
   if (median <= RAIL_LOW || median >= RAIL_HIGH) {   // this reading is a floated rail, not real
     if (lastGood >= 0) return lastGood;              // substitute the last trustworthy reading
+  } else if (lastGood >= 0 && millis() < noiseBlankUntil
+             && abs(median - lastGood) > SLIDER_JUMP_MAX) {   // implausible jump, still inside the post-reversal window
+    return lastGood;                                 // distrust it - this is the motor's own transient, not real travel
   } else {
     lastGood = median;                               // remember this reading as trustworthy
   }
@@ -657,6 +705,40 @@ void showLevel(int lv) {
     if (k >= first && k < first + lit) strip.setPixelColor(LED_SLOT[k], c);   // light this one of the six
   }
   strip.show();   // push the buffer to the physical ring
+}
+
+// Returns 4 if the name is not one of OFF/LOW/MEDIUM/HIGH.
+uint8_t parseLevel(const char *n) {
+  for (uint8_t i = 0; i < 4; i++) if (eq(n, LEVEL_NAME[i])) return i;   // match against OFF/LOW/MEDIUM/HIGH
+  if (eq(n, "MED")) return 2;   // short form, same as the arm states accept
+  return 4;                     // not a recognised name
+}
+
+// A raw slider position squarely inside a level's band, on the SLIDER_MAX side - used
+// by the F:<level> command to simulate a hand leaving the slider there and letting go.
+int levelPosition(uint8_t level) {
+  if (level == 0) return SLIDER_CENTER;
+  const int lo[4] = { 0, DIST_OFF_LOW,  DIST_LOW_MED,  DIST_MED_HIGH };
+  const int hi[4] = { 0, DIST_LOW_MED,  DIST_MED_HIGH, HALF_TRAVEL   };
+  return SLIDER_CENTER + (lo[level] + hi[level]) / 2;   // middle of that level's band
+}
+
+// Starts a paced swing for one level (OFF excluded - see the F: command): pointA/
+// pointB are set the same way a hand-release swing would (this level's band position
+// and its mirror about centre), but the motor tracks a smoothly ping-ponging target
+// on PACE_SECONDS[level]'s own clock instead of driving flat-out to a fixed end.
+void startPaced(uint8_t level) {
+  int pos = levelPosition(level);
+  pointA = constrain(pos, SLIDER_MIN, SLIDER_MAX);
+  pointB = constrain(SLIDER_MIN + SLIDER_MAX - pointA, SLIDER_MIN, SLIDER_MAX);
+  faderLevel = level;
+  pacePhase = 0;
+  paceLastTick = millis();
+  motorCoast();
+  faderMode = FD_PACED;
+  Serial.print(F("OK:paced ")); Serial.print(LEVEL_NAME[level]);
+  Serial.print(F("  ")); Serial.print(pointA); Serial.print(F(" <-> ")); Serial.print(pointB);
+  Serial.print(F("  over ")); Serial.print(PACE_SECONDS[level], 1); Serial.println(F("s"));
 }
 
 // Capture: the slider has been left somewhere, so mirror that position and swing
@@ -736,11 +818,15 @@ void detectFrom(int x) {
   against = 0;                         // no reverse movement counted yet
   prevSlider = x;                      // baseline for direction tracking
   moveStart = millis();                // timeout clock for this leg starts now
+  noiseBlankUntil = millis() + SLIDER_BLANK_MS;   // ride out the motor's own turn-on transient
   faderMode = FD_SWINGING;
 }
 
 // Flip to the other end of the swing and restart this leg
 void swapTarget(int sliderVal) {
+  Serial.print(F("swap at ")); Serial.print(sliderVal);         // timing/position marker, for
+  Serial.print(F("  t=")); Serial.println(millis());            // measuring the real swing period
+  noiseBlankUntil = millis() + SLIDER_BLANK_MS;   // ride out the motor's own reversal transient
   targetVal = (targetVal == pointA) ? pointB : pointA;   // switch to whichever end we were not driving toward
   bestGap = abs(targetVal - sliderVal);                  // distance to the new target from here
   legStartGap = bestGap;
@@ -1043,6 +1129,40 @@ void faderUpdate() {
       }
       break;
     }
+
+    // ---- Paced: chase a target that is itself ping-ponging smoothly, timed to
+    // PACE_SECONDS[faderLevel] - the same triangle wave the arms use, just applied
+    // to a slider position instead of a servo angle. A small deadband around the
+    // live target means the motor only taps in short bursts rather than driving
+    // continuously, which is what lets the average speed come out slow even though
+    // the motor itself has no low-speed setting that isn't "don't move at all".
+    case FD_PACED: {
+      unsigned long now = millis();
+      float dt = (now - paceLastTick) / 1000.0;
+      paceLastTick = now;
+      float rate = TWO_PI / PACE_SECONDS[faderLevel];
+      pacePhase += rate * dt;
+
+      float cyc = fmod(pacePhase, TWO_PI);
+      if (cyc < 0) cyc += TWO_PI;
+      float tri = (cyc < PI) ? (cyc / PI) * 2.0 - 1.0            // -1 -> +1
+                             : 1.0 - ((cyc - PI) / PI) * 2.0;     // +1 -> -1
+
+      int mid  = (pointA + pointB) / 2;
+      int half = abs(pointB - pointA) / 2;
+      int liveTarget = mid + (int)(tri * half);
+
+      if (sliderVal < liveTarget - PACE_DEADBAND)      motorForward(SWING_SPEED[faderLevel]);
+      else if (sliderVal > liveTarget + PACE_DEADBAND) motorBackward(SWING_SPEED[faderLevel]);
+      else                                              motorCoast();   // close enough - let it sit
+
+      if (millis() - lastSliderPrint >= 100) {   // 10Hz, matches the FD_GRABBED print rate
+        lastSliderPrint = millis();
+        Serial.print(F("paced slider: ")); Serial.print(sliderVal);
+        Serial.print(F("  target: "));     Serial.println(liveTarget);
+      }
+      break;
+    }
   }
 }
 
@@ -1306,6 +1426,39 @@ void handleLine(char *s) {
     return;
   }
 
+  // F:<level> — operate the fader from the serial line, paced to match the arms'
+  // own timing (PACE_SECONDS) rather than driving flat-out. <level> is OFF/LOW/
+  // MEDIUM/HIGH (or MED). F:<raw value> (e.g. F:700) instead places it at an exact
+  // position via the old flat-out hand-release behaviour - pacing needs a named
+  // level to look up a duration for. e.g. F:HIGH, F:700
+  if (kind == 'F' && s[1] == ':') {
+    char *arg = s + 2;
+    uint8_t lvl = parseLevel(arg);
+
+    if (lvl == 0) {                          // OFF - just rest where it is, nothing to pace
+      motorCoast();
+      faderLevel = 0;
+      idleRef = readSlider();
+      targetVal = idleRef;
+      faderMode = FD_IDLE;
+      Serial.println(F("OK:F OFF"));
+      return;
+    }
+    if (lvl < 4) {                           // named level - paced swing
+      startPaced(lvl);
+      return;
+    }
+
+    // Not a level name - treat it as a raw target position instead, same as before.
+    int pos = constrain(atoi(arg), SLIDER_MIN, SLIDER_MAX);
+    handMin = pos - MIN_GESTURE;
+    handMax = pos + MIN_GESTURE;
+    motorCoast();
+    Serial.print(F("OK:F ")); Serial.println(pos);
+    detectFrom(pos);
+    return;
+  }
+
   // D:<duty> — drive the fader motor directly, bypassing every bit of logic.
   // Positive drives forward, negative backward, 0 coasts. Purely a wiring/supply
   // probe: if this does nothing, the fault is not in the control code.
@@ -1316,8 +1469,16 @@ void handleLine(char *s) {
     else if (duty > 0) motorForward(duty > 255 ? 255 : duty);     // clamp to the PWM ceiling
     else if (duty < 0) motorBackward(-duty > 255 ? 255 : -duty);  // clamp to the PWM ceiling
     else               motorCoast();
+    int sv = readSlider();
+    // Without this, idleRef is left stale from whatever set it last, so the very next
+    // faderUpdate() pass in FD_IDLE compares the current reading against that old value,
+    // reads it as a hand touching the slider, and calls detectFrom() on its own - which
+    // is what made D:0 look like it "didn't stick" after a swing: it restarted a tiny
+    // flat-out swing by itself every time.
+    idleRef = sv;
+    targetVal = sv;    // keep the status line in sync too
     Serial.print(F("OK:D ")); Serial.print(duty);
-    Serial.print(F(" slider=")); Serial.println(readSlider());
+    Serial.print(F(" slider=")); Serial.println(sv);
     return;
   }
 
