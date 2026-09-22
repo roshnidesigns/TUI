@@ -68,7 +68,7 @@
  *   F:<value>          flat-out to an exact raw slider position instead, e.g. F:700
  *   1 / 2 / 3 / 0      all arms to low / medium / high / stop
  *   a                  start the standalone demo cycle
- *   c                  hold every arm at CENTER_ANGLE
+ *   c                  hold every arm at CENTER_ANGLE and home the fader to centre
  *
  *   Telemetry, 10Hz:  S:<state>,<run>,<angle>;<state>,<run>,<angle>
  *
@@ -1121,7 +1121,9 @@ bool handleKey(char c) {
               Serial.println(F("OK:key demo cycle resumed")); return true;
     case 'c': takeControl(); holdCenter = true;                 // park every arm at CENTER_ANGLE
               for (uint8_t i = 0; i < ARM_COUNT; i++) { armRunning[i] = true; attachArm(i, true); }
-              Serial.println(F("OK:key holding CENTER_ANGLE")); return true;
+              moveStart = millis();                             // and drive the fader back to its centre mark
+              faderMode = FD_HOMING;                             // same path as the initial boot homing
+              Serial.println(F("OK:key holding CENTER_ANGLE, fader homing to centre")); return true;
     case 'k': calibrate(); return true;                         // drive to both fader stops and measure travel
     default:  return false;    // not a recognised single-character command
   }
