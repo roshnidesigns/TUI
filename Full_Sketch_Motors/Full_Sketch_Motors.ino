@@ -696,19 +696,17 @@ void detectFrom(int x) {
     return;
   }
 
-  targetVal = (abs(x - pointA) > abs(x - pointB)) ? pointA : pointB;  // head for the FARTHER end first
-  bestGap = abs(targetVal - x);        // starting distance to that end
-  legStartGap = bestGap;               // remembered for reference at the start of this leg
-  grabArmed = false;                   // this leg has not yet proven it is making progress
-  boost = 0;                           // no extra duty yet
-  stallRef = -999;                     // force the stall timer to reset on the first check
-  stallTime = millis();
-  holdTime = millis();
-  against = 0;                         // no reverse movement counted yet
-  prevSlider = x;                      // baseline for direction tracking
-  moveStart = millis();                // timeout clock for this leg starts now
-  noiseBlankUntil = millis() + SLIDER_BLANK_MS;   // ride out the motor's own turn-on transient
-  faderMode = FD_SWINGING;
+  // Paced, timed to PACE_SECONDS[faderLevel] - same as the F:<level> command, so a
+  // hand-release swing matches the arms too, not just a serial-triggered one. The
+  // paced clock starts at the phase matching where the hand actually left the slider
+  // (rather than always at 0), so the target begins right where the slider already
+  // is instead of snapping to an arbitrary point in the cycle.
+  float half = abs(pointB - pointA) / 2.0;
+  float tri0 = half > 0 ? constrain((float)(x - SLIDER_CENTER) / half, -1.0, 1.0) : 0.0;
+  pacePhase = PI * (tri0 + 1.0) / 2.0;
+  paceLastTick = millis();
+  motorCoast();
+  faderMode = FD_PACED;
 }
 
 // Flip to the other end of the swing and restart this leg
