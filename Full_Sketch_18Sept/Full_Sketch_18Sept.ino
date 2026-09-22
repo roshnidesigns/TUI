@@ -140,11 +140,13 @@ const uint8_t LED_PIN   = LED_BUILTIN;   // pin 6 on the MKR boards
 
 // Resting pose — the middle of each arm's swing. State changes how an arm MOVES, not
 // where it sits. Three entries, so the others are ready when you add them.
-// Arm 1 is confirmed vertical at 96 on the real object. Arm 0 was inherited at 60,
-// which put HIGH's sweep at 20-100 degrees — far enough down that the linkage stalled
-// against its stop and the servo cooked. Starting it at the known-good 96 until it is
-// measured; use C:<arm>:<angle> to find the true vertical and paste it back here.
-const int CENTER_ANGLE[MAX_ARMS] = { 96, 96, 93 };   // resting vertical, one entry per arm
+// Arm 0 (D0) is confirmed vertical at 96. Arm 1 (D7) was also 96, but after a HIGH
+// swing that ran wider than intended (a stale build put it at +/-40 degrees instead
+// of the +/-30 here), the horn most likely slipped a tooth on the servo spline -
+// this is an open-loop system, so a slip like that is invisible to the code and only
+// shows up as the arm no longer sitting where 96 used to put it. Re-measured and
+// confirmed at 101 with C:1:<angle>. If it drifts again, re-measure the same way.
+const int CENTER_ANGLE[MAX_ARMS] = { 96, 101, 93 };   // resting vertical, one entry per arm
 
 // Hard clamp on every movement. Keep inside whatever the linkage can physically reach.
 const int ANGLE_MIN = 10;
@@ -160,10 +162,13 @@ const char *STATE_NAME[STATE_COUNT] = { "LOW", "MED", "HIGH" };        // for se
 // Live-tunable so a state can be dialled in against the real object without a
 // re-upload — see the V: command. Whatever you settle on, paste it back here.
 // Equal quarters, the same division the fader uses. ARM_REACH is how far an arm can
-// swing either side of centre; Low/Medium/High take two, three and four quarters of
-// it, so each step up widens the swing by the same amount.
+// swing either side of centre; Low and High take two and four quarters of it, so
+// each step up widens the swing by the same amount. MEDIUM is pulled in a bit
+// further than its own quarter (22.5 degrees) to 18, on request - it was reading as
+// too wide next to LOW and HIGH on the real object. Adjust here, or live via
+// V:MED:<amp>:<rate> to test before committing to a number.
 #define ARM_REACH 30.0                                                          // max degrees either side of centre, at HIGH
-float stateAmp[STATE_COUNT]  = { ARM_REACH * 0.50, ARM_REACH * 0.75, ARM_REACH };  // degrees either side of centre, per state
+float stateAmp[STATE_COUNT]  = { ARM_REACH * 0.50, 18.0, ARM_REACH };  // degrees either side of centre, per state
 float stateRate[STATE_COUNT] = { 0.18,  0.45,  0.60 };  // radians per second
 
 // Seconds to cross from one state's amplitude/speed to another's. A state change is a
@@ -185,6 +190,7 @@ bool  servosAttached[MAX_ARMS] = { false, false, false };   // whether attach() 
 // Everything below is per arm.
 State armState[MAX_ARMS]   = { ST_MED, ST_MED, ST_MED };   // which level each arm is set to
 bool  armRunning[MAX_ARMS] = { false, false, false };      // whether this arm is currently swinging
+bool  armHeld[MAX_ARMS]    = { false, false, false };      // C:<arm>:<angle> hold - frozen, ignored by updateArms()
 float armAngle[MAX_ARMS];                                  // what the servo is actually holding right now
 unsigned long restSince[MAX_ARMS] = { 0, 0, 0 };           // when an arm arrived at rest (0 = not resting yet)
 float armAmp[MAX_ARMS]  = { 0, 0, 0 };   // smoothed toward the state's amplitude
@@ -207,6 +213,9 @@ unsigned long lastSwitch = 0;   // millis() timestamp the demo cycle last change
 char line[32];                 // incoming serial command, built up character by character
 uint8_t lineLen = 0;            // how many characters of `line` are filled so far
 unsigned long lastTick = 0, lastReport = 0;   // millis() timestamps for the motion and telemetry timers
+
+#define ARM_PRINT_MS 200          // how often to print a moving arm's angle, ms
+unsigned long lastArmPrint = 0;   // millis() timestamp of the last angle print
 
 // ---------------------------------------------------------------- led
 
@@ -297,6 +306,7 @@ void startArm(uint8_t i, State s) {
   if (!armRunning[i]) armAmp[i] = stateAmp[s];    // only snap amplitude when starting from a stop
   armState[i] = s;          // record the requested level
   armRunning[i] = true;     // this arm should now be swinging
+  armHeld[i] = false;       // a state command always overrides a manual C: hold
   holdCenter = false;       // starting an arm cancels the "hold at centre" calibration mode
   attachArm(i, true);       // make sure pulses are actually reaching the servo
 }
@@ -307,7 +317,7 @@ void startAll(State s) { for (uint8_t i = 0; i < ARM_COUNT; i++) startArm(i, s);
 // Any command from outside takes the object off its standalone demo cycle.
 void takeControl() { autoCycle = false; }
 
-void stopArm(uint8_t i) { armRunning[i] = false; }   // eases home and holds there, powered
+void stopArm(uint8_t i) { armRunning[i] = false; armHeld[i] = false; }   // eases home and holds there, powered
 void stopAll() {
   for (uint8_t i = 0; i < ARM_COUNT; i++) stopArm(i);
   holdCenter = false;   // also cancel the centre-holding calibration mode
@@ -328,6 +338,12 @@ void updateArms(float dt) {
   float maxStep = SLEW_DEG_PER_SEC * dt;              // maximum angle change allowed this tick
 
   for (uint8_t i = 0; i < ARM_COUNT; i++) {
+    // A C:<arm>:<angle> hold freezes this arm entirely - skip it here so it is not
+    // pulled back toward CENTER_ANGLE the instant it is set. Without this, holding
+    // was purely cosmetic: the very next tick would ease it straight back to centre,
+    // since "not running" otherwise always means "target = CENTER_ANGLE".
+    if (armHeld[i]) continue;
+
     State s = armState[i];
     bool moving = armRunning[i] && !holdCenter;   // should this arm actually be swinging right now?
 
@@ -435,19 +451,17 @@ void updateArms(float dt) {
 #define BAND_HYSTERESIS 8   // a reading must clear a boundary by this much to change level
 
 // ---- NeoPixel --------------------------------------------------------------
-// Eight pixels. The lit pair moves OUTWARD from the middle as the faderLevel rises,
-// so the strip reads as the battery opening up.
+// A 24-pixel ring; only six of them are ever lit, as one continuous arc rather
+// than spread around the ring. They light in pairs, outward from the middle of
+// that arc - two at Low, four at Medium, six at High - so the ring reads as the
+// battery opening up. Ported over from Fader_Mirror, same mapping.
 //
-//     off      nothing
-//     low      pixels 4,5            the middle pair
-//     medium   pixels 3,4,5,6        widening
-//     high     pixels 1..8           the whole strip
-//
-// Numbering below is 0-based, so your 1..8 become 0..7.
-#define STRIP_COUNT 8         // NOTE: still the old 8-pixel strip - the 24-LED ring change
-                               // (six pixels lit as a growing arc) lives only in Fader_Mirror
-                               // so far; port it here if this sketch drives the ring.
+// Change LED_SLOT to move which six consecutive physical pixels the arc sits on.
+#define STRIP_COUNT 24        // the whole ring; only six of them are ever lit
 #define STRIP_BRIGHTNESS 90
+const uint8_t LED_USED = 6;                                    // how many of the 24 pixels are ever lit
+const uint8_t LED_SLOT[LED_USED] = { 5, 6, 7, 8, 9, 10 };       // which physical pixel indices those six are
+const uint8_t LED_LIT[4] = { 0, 2, 4, 6 };                      // pixels lit, indexed by level
 
 // How hard each faderLevel is driven. The swing's ENDS come from the mirror - where you
 // left the slider, and its reflection - so the gesture is yours; the faderLevel only says
@@ -610,21 +624,9 @@ int levelFor(int reading, int current) {
 }
 
 // ---- NeoPixel --------------------------------------------------------------------
-Adafruit_NeoPixel strip(STRIP_COUNT, STRIP_PIN, NEO_GRB + NEO_KHZ800);   // the strip driver object
+Adafruit_NeoPixel strip(STRIP_COUNT, STRIP_PIN, NEO_GRB + NEO_KHZ800);   // the ring driver object
 
-// Which pixels each faderLevel lights, as a bitmask over 0..7. The fill grows OUTWARD
-// from the middle pair, so the strip reads as a faderLevel rising rather than a pattern
-// changing - each faderLevel keeps everything the one below it lit.
-//
-//     off      nothing
-//     low      4,5              the middle pair
-//     medium   3,4,5,6          widening
-//     high     1,2,3,4,5,6,7,8  the whole strip
-//
-// Bit 0 is pixel 1, so the masks below read right-to-left.
-const uint8_t STRIP_MASK[4] = { 0b00000000, 0b00011000, 0b00111100, 0b11111111 };   // one mask per level
-
-// Colour per faderLevel. The fill grows outward AND heats up as the faderLevel rises.
+// Colour per faderLevel. The lit arc grows outward AND heats up as the faderLevel rises.
 const uint32_t STRIP_COLOUR[4] = {
   0x000000,   // off
   0xFFC400,   // low    - yellow
@@ -634,17 +636,21 @@ const uint32_t STRIP_COLOUR[4] = {
 
 int shownLevel = -1;   // so the strip is only rewritten when it actually changes
 
-// Redraws the strip only when the level has actually changed.
+// Redraws the ring only when the level has actually changed, growing the lit arc
+// outward from its middle so it never blinks or flickers between calls.
 void showLevel(int lv) {
   if (lv == shownLevel) return;    // nothing changed - leave the strip alone
   shownLevel = lv;                 // remember what is now showing
 
-  uint8_t mask = STRIP_MASK[lv];   // which pixels should be lit at this level
   uint32_t c = STRIP_COLOUR[lv];   // colour for this level
-  for (int i = 0; i < STRIP_COUNT; i++) {
-    strip.setPixelColor(i, (mask & (1 << i)) ? c : 0);   // lit if this pixel's bit is set, else off
+  uint8_t lit = LED_LIT[lv];       // how many of the six pixels should be on
+  uint8_t first = (LED_USED - lit) / 2;    // grow outward from the middle of the six
+
+  strip.clear();                            // the other eighteen stay dark
+  for (uint8_t k = 0; k < LED_USED; k++) {
+    if (k >= first && k < first + lit) strip.setPixelColor(LED_SLOT[k], c);   // light this one of the six
   }
-  strip.show();   // push the buffer to the physical strip
+  strip.show();   // push the buffer to the physical ring
 }
 
 // Capture: the slider has been left somewhere, so mirror that position and swing
@@ -1068,6 +1074,22 @@ void report() {
   Serial.println();
 }
 
+// Human-readable angle for every arm that is currently swinging, e.g. "angle  D0: 108
+// D7: 76". Prints nothing when no arm is running, so an idle board stays quiet. This
+// is separate from the S: telemetry line above (which report() prints unconditionally,
+// in a compact format meant for the web page) - this one is meant to be read by eye.
+void printMovingAngles() {
+  bool printedAny = false;
+  for (uint8_t i = 0; i < ARM_COUNT; i++) {
+    if (!armRunning[i]) continue;   // only arms actually moving right now
+    if (!printedAny) { Serial.print(F("angle  ")); printedAny = true; }
+    else Serial.print(F("   "));
+    Serial.print(F("D")); Serial.print(SERVO_PIN[i]);
+    Serial.print(F(": ")); Serial.print((int)(armAngle[i] + 0.5));
+  }
+  if (printedAny) Serial.println();
+}
+
 // Single characters typed into the Serial Monitor. Returns true if handled.
 bool handleKey(char c) {
   switch (c) {
@@ -1159,6 +1181,7 @@ void handleLine(char *s) {
     ang = (int)clampf(ang, ANGLE_MIN, ANGLE_MAX);    // never command past what the linkage can reach
     takeControl();
     armRunning[idx] = false;      // this arm is being held, not swinging
+    armHeld[idx] = true;          // freeze it - updateArms() now skips this arm entirely
     restSince[idx] = 0;
     attachArm(idx, true);         // make sure pulses reach the servo
     armAngle[idx] = ang;
@@ -1303,5 +1326,10 @@ void loop() {
     lastReport = now;
     report();
     // Fader state on its own line, so the S: format stays exactly as it was.
+  }
+
+  if (now - lastArmPrint >= ARM_PRINT_MS) {   // 5 Hz human-readable angle print
+    lastArmPrint = now;
+    printMovingAngles();
   }
 }
