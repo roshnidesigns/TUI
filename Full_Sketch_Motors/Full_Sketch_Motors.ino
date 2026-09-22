@@ -408,7 +408,7 @@ void updateArms(float dt) {
 //     high     1,2,3,4,5,6,7,8  the whole strip
 // Bit 0 is pixel 1, so the masks below read right-to-left.
 #define STRIP_COUNT 8
-#define STRIP_BRIGHTNESS 90
+#define STRIP_BRIGHTNESS 50
 const uint8_t STRIP_MASK[4] = { 0b00000000, 0b00011000, 0b00111100, 0b11111111 };   // which pixels light, indexed by level
 
 // How hard each faderLevel is driven. The swing's ENDS come from the mirror - where you
@@ -503,6 +503,15 @@ FaderMode faderMode = FD_HOMING;   // start every power-up by driving to the cen
 // for a real hand-release, where matching the arms doesn't apply).
 const float PACE_SECONDS[4] = { 0.0, 35.0, 14.0, 10.5 };   // OFF unused, LOW/MED/HIGH - same table as the arms
 #define PACE_DEADBAND 15    // how close to the live target counts as "there" - coast inside it
+
+// The ideal triangle-wave target advances at a constant rate from the instant a swing
+// starts, but the physical slider starts from a dead stop (just released, or just
+// caught after a stall) and needs a moment to accelerate. Without a limit, the ideal
+// target can race far ahead before the motor makes one big corrective jump to catch
+// up, which reads as snapping to an unrelated spot - same problem the arms solve with
+// a slew limit on their own commanded angle. This bounds how far the DRIVEN target is
+// allowed to lead the actual position, so the motor always chases a nearby point.
+#define PACE_MAX_LEAD 50
 float pacePhase = 0;                // radians, this swing's own clock, wraps via fmod
 unsigned long paceLastTick = 0;     // millis() timestamp of the last FD_PACED update, for dt
 
@@ -1030,7 +1039,8 @@ void faderUpdate() {
 
       int mid  = (pointA + pointB) / 2;
       int half = abs(pointB - pointA) / 2;
-      int liveTarget = mid + (int)(tri * half);
+      int idealTarget = mid + (int)(tri * half);
+      int liveTarget = constrain(idealTarget, sliderVal - PACE_MAX_LEAD, sliderVal + PACE_MAX_LEAD);   // never let it race ahead
 
       int dir = 0;
       if (sliderVal < liveTarget - PACE_DEADBAND)      { motorForward(SWING_SPEED[faderLevel]);  dir = 1; }
