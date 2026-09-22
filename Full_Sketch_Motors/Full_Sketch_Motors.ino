@@ -487,7 +487,8 @@ enum FaderMode { FD_HOMING, FD_SWINGING, FD_GRABBED, FD_IDLE, FD_PACED };  // FD
                                                                    // FD_GRABBED: motor off, a hand is moving the slider
                                                                    // FD_IDLE: motor off, resting at OFF
                                                                    // FD_PACED: tracking a smoothly ping-ponging target,
-                                                                   //   timed to match a chosen seconds-per-swing
+                                                                   //   timed to match a chosen seconds-per-swing;
+                                                                   //   also watches for a hand grabbing mid-swing
 FaderMode faderMode = FD_HOMING;   // start every power-up by driving to the centre mark
 
 // ---- Paced swing (F:<level>) - speed-matched to the arms' own timing ------------
@@ -629,6 +630,8 @@ void startPaced(uint8_t level) {
   faderLevel = level;
   pacePhase = 0;
   paceLastTick = millis();
+  prevSlider = readSlider();   // baseline for FD_PACED's own hand-pushback check
+  against = 0;
   motorCoast();
   faderMode = FD_PACED;
   Serial.print(F("OK:paced ")); Serial.print(LEVEL_NAME[level]);
@@ -705,6 +708,8 @@ void detectFrom(int x) {
   float tri0 = half > 0 ? constrain((float)(x - SLIDER_CENTER) / half, -1.0, 1.0) : 0.0;
   pacePhase = PI * (tri0 + 1.0) / 2.0;
   paceLastTick = millis();
+  prevSlider = x;   // baseline for FD_PACED's own hand-pushback check
+  against = 0;
   motorCoast();
   faderMode = FD_PACED;
 }
@@ -826,9 +831,12 @@ void faderSetup() {
 void faderUpdate() {
   int sliderVal = readSlider();     // one filtered, noise-rejected reading for this pass
 
-  // The strip shows the faderLevel you SET and holds it - not the live reading, which
-  // sweeps across every band mid-swing and would flicker the colour continuously.
-  showLevel(faderLevel < 0 ? 0 : faderLevel);
+  // The strip normally shows the faderLevel you SET and holds it - not the live
+  // reading, which sweeps across every band mid-swing and would flicker the colour
+  // continuously. While a hand is actually on the slider, though, the live position
+  // IS what matters, so it tracks that instead until you let go.
+  if (faderMode == FD_GRABBED) showLevel(levelFor(sliderVal, faderLevel));
+  else                         showLevel(faderLevel < 0 ? 0 : faderLevel);
 
   // Print status only on a real change, not on a timer (the 10Hz S: telemetry below
   // is separate and untouched - the web page depends on its steady beat).
@@ -1023,9 +1031,27 @@ void faderUpdate() {
       int half = abs(pointB - pointA) / 2;
       int liveTarget = mid + (int)(tri * half);
 
-      if (sliderVal < liveTarget - PACE_DEADBAND)      motorForward(SWING_SPEED[faderLevel]);
-      else if (sliderVal > liveTarget + PACE_DEADBAND) motorBackward(SWING_SPEED[faderLevel]);
+      int dir = 0;
+      if (sliderVal < liveTarget - PACE_DEADBAND)      { motorForward(SWING_SPEED[faderLevel]);  dir = 1; }
+      else if (sliderVal > liveTarget + PACE_DEADBAND) { motorBackward(SWING_SPEED[faderLevel]); dir = -1; }
       else                                              motorCoast();   // close enough - let it sit
+
+      // A hand grabbing the slider mid-swing would otherwise just get fought by the
+      // motor still chasing liveTarget. Same pushback idea as the old FD_SWINGING:
+      // moving opposite to the direction just driven, sustained, is a hand.
+      int delta = sliderVal - prevSlider;
+      prevSlider = sliderVal;
+      if (dir != 0) {
+        if (delta * dir > 0) {
+          against = 0;
+        } else if (delta * dir < 0) {
+          against += -delta * dir;
+          if (against > REVERSE_MARGIN) {
+            handDetected(sliderVal);
+            break;
+          }
+        }
+      }
 
       if (millis() - lastSliderPrint >= 100) {   // 10Hz, matches the FD_GRABBED print rate
         lastSliderPrint = millis();
