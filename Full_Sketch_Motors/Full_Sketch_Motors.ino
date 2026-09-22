@@ -1042,9 +1042,15 @@ void faderUpdate() {
       int idealTarget = mid + (int)(tri * half);
       int liveTarget = constrain(idealTarget, sliderVal - PACE_MAX_LEAD, sliderVal + PACE_MAX_LEAD);   // never let it race ahead
 
+      // Tapered, not full duty every correction - the same driveSpeed() the old
+      // flat-out mode used, so a small correction (e.g. right after a hand-release
+      // leaves a gap) eases in rather than lurching at full SWING_SPEED, which is
+      // what a short, hard, full-speed burst reads as: a snap.
+      int gap = abs(sliderVal - liveTarget);
+      int duty = driveSpeed(gap, SWING_SPEED[faderLevel]);
       int dir = 0;
-      if (sliderVal < liveTarget - PACE_DEADBAND)      { motorForward(SWING_SPEED[faderLevel]);  dir = 1; }
-      else if (sliderVal > liveTarget + PACE_DEADBAND) { motorBackward(SWING_SPEED[faderLevel]); dir = -1; }
+      if (sliderVal < liveTarget - PACE_DEADBAND)      { motorForward(duty);  dir = 1; }
+      else if (sliderVal > liveTarget + PACE_DEADBAND) { motorBackward(duty); dir = -1; }
       else                                              motorCoast();   // close enough - let it sit
 
       // A hand grabbing the slider mid-swing would otherwise just get fought by the
