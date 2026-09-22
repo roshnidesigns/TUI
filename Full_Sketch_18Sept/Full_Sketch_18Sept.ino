@@ -14,13 +14,12 @@
  *
  *   level    amplitude          seconds per there-and-back
  *   LOW      ±15°               35
- *   MEDIUM   ±22°               14
- *   HIGH     ±30°               10.5
+ *   MEDIUM   ±35°               14
+ *   HIGH     ±50°               10.5
  *
- * Amplitudes are equal quarters of ARM_REACH, so changing that one number
- * rescales all three together. Arms ping-pong rather than sway: a sine lingers at
- * the ends and rushes the middle, where the fader crosses at a constant rate and
- * turns sharply — matching them makes the two halves read as one object.
+ * Arms ping-pong rather than sway: a sine lingers at the ends and rushes the middle,
+ * where the fader crosses at a constant rate and turns sharply — matching them makes
+ * the two halves read as one object.
  *
  * A stopped arm eases back to CENTER_ANGLE and then RELEASES. Holding torque at
  * rest keeps it rigidly vertical but means the servo pushes continuously, and if
@@ -60,6 +59,8 @@
  *   T:<state>          start every arm
  *   X:<arm>  /  X      stop one arm / all of them
  *   C:<arm>:<angle>    hold one arm still, for finding its resting vertical
+ *   A                  print the live per-arm left/right trim table
+ *   A:<arm>:<pos>:<neg>   trim one side of an arm's swing to match the other
  *   V                  print the live amplitude/speed table
  *   V:<state>:<amp>:<rate>   retune a level without re-uploading
  *   k                  calibrate the fader's travel
@@ -74,7 +75,7 @@
  *   CENTER_ANGLE   each arm's resting vertical. Get this wrong and the arm is
  *                  driven past what the linkage can reach, where it stalls
  *                  against its stop and overheats. Find it with C:<arm>:<angle>.
- *   ARM_REACH      how far the arms swing. One number, all three levels.
+ *   stateAmp       how far each level swings, in degrees either side of centre.
  *   SLIDER_MIN/MAX the fader's measured travel; every band edge derives from it.
  *
  * ── THINGS LEARNED THE HARD WAY — please do not undo these ──────────────────
@@ -140,17 +141,24 @@ const uint8_t LED_PIN   = LED_BUILTIN;   // pin 6 on the MKR boards
 
 // Resting pose — the middle of each arm's swing. State changes how an arm MOVES, not
 // where it sits. Three entries, so the others are ready when you add them.
-// Arm 0 (D0) is confirmed vertical at 96. Arm 1 (D7) was also 96, but after a HIGH
-// swing that ran wider than intended (a stale build put it at +/-40 degrees instead
-// of the +/-30 here), the horn most likely slipped a tooth on the servo spline -
-// this is an open-loop system, so a slip like that is invisible to the code and only
-// shows up as the arm no longer sitting where 96 used to put it. Re-measured and
-// confirmed at 101 with C:1:<angle>. If it drifts again, re-measure the same way.
-const int CENTER_ANGLE[MAX_ARMS] = { 96, 101, 93 };   // resting vertical, one entry per arm
+// Both arm 0 (D0) and arm 1 (D7) confirmed vertical at 93 with C:<arm>:<angle>. This
+// is an open-loop system, so a horn slipping a tooth on the servo spline is invisible
+// to the code and only shows up as the arm no longer sitting where 93 used to put it.
+// If it drifts again, re-measure the same way.
+const int CENTER_ANGLE[MAX_ARMS] = { 93, 93, 93 };   // resting vertical, one entry per arm
 
 // Hard clamp on every movement. Keep inside whatever the linkage can physically reach.
 const int ANGLE_MIN = 10;
-const int ANGLE_MAX = 170;
+const int ANGLE_MAX = 210;
+
+// Per-arm, per-side trim for a swing that reads wider on one side than the other.
+// The ping-pong math below is symmetric by construction, so a lopsided swing on the
+// real object is almost always the linkage geometry (equal servo degrees do not
+// always produce equal visible travel), not the math. 1.0 = no trim; 0.8 pulls that
+// side in by 20%. Tune live with A:<arm>:<posScale>:<negScale> — watch which side is
+// still wider, nudge that side's scale down, repeat — then paste the values back here.
+float ampScalePos[MAX_ARMS] = { 1.0, 1.0, 1.0 };   // scale for the tri >= 0 half of the swing
+float ampScaleNeg[MAX_ARMS] = { 1.0, 1.0, 1.0 };   // scale for the tri <  0 half of the swing
 
 enum State { ST_LOW = 0, ST_MED = 1, ST_HIGH = 2, STATE_COUNT = 3 };   // the three swing levels
 const char *STATE_NAME[STATE_COUNT] = { "LOW", "MED", "HIGH" };        // for serial printouts
@@ -161,14 +169,10 @@ const char *STATE_NAME[STATE_COUNT] = { "LOW", "MED", "HIGH" };        // for se
 //                                          LOW    MED    HIGH
 // Live-tunable so a state can be dialled in against the real object without a
 // re-upload — see the V: command. Whatever you settle on, paste it back here.
-// Equal quarters, the same division the fader uses. ARM_REACH is how far an arm can
-// swing either side of centre; Low and High take two and four quarters of it, so
-// each step up widens the swing by the same amount. MEDIUM is pulled in a bit
-// further than its own quarter (22.5 degrees) to 18, on request - it was reading as
-// too wide next to LOW and HIGH on the real object. Adjust here, or live via
-// V:MED:<amp>:<rate> to test before committing to a number.
-#define ARM_REACH 30.0                                                          // max degrees either side of centre, at HIGH
-float stateAmp[STATE_COUNT]  = { ARM_REACH * 0.50, 18.0, ARM_REACH };  // degrees either side of centre, per state
+// Set directly per level rather than derived from a single reach number - MED and
+// HIGH were both pulled in from their original quarter-division on request, tested
+// live via V:<state>:<amp>:<rate> against the real object before committing here.
+float stateAmp[STATE_COUNT]  = { 15.0, 35.0, 50.0 };   // degrees either side of centre, per state
 float stateRate[STATE_COUNT] = { 0.18,  0.45,  0.60 };  // radians per second
 
 // Seconds to cross from one state's amplitude/speed to another's. A state change is a
@@ -213,9 +217,10 @@ unsigned long lastSwitch = 0;   // millis() timestamp the demo cycle last change
 char line[32];                 // incoming serial command, built up character by character
 uint8_t lineLen = 0;            // how many characters of `line` are filled so far
 unsigned long lastTick = 0, lastReport = 0;   // millis() timestamps for the motion and telemetry timers
+unsigned long lastSliderPrint = 0;            // millis() timestamp the slider value was last printed while grabbed
 
-#define ARM_PRINT_MS 200          // how often to print a moving arm's angle, ms
-unsigned long lastArmPrint = 0;   // millis() timestamp of the last angle print
+bool  lastArmRunning[MAX_ARMS] = { false, false, false };   // so the angle line below only
+State lastArmState[MAX_ARMS]   = { ST_MED, ST_MED, ST_MED };  // prints when something changes
 
 // ---------------------------------------------------------------- led
 
@@ -366,8 +371,9 @@ void updateArms(float dt) {
     float tri = (cycle < PI) ? (cycle / PI) * 2.0 - 1.0     // -1 -> +1
                              : 1.0 - ((cycle - PI) / PI) * 2.0;  // +1 -> -1
 
+    float dirScale = (tri >= 0) ? ampScalePos[i] : ampScaleNeg[i];   // per-side trim for this arm
     float target = moving
-      ? CENTER_ANGLE[i] + tri * armAmp[i]   // swinging - centre plus the triangle wave scaled by amplitude
+      ? CENTER_ANGLE[i] + tri * armAmp[i] * dirScale   // swinging - centre plus the triangle wave scaled by amplitude and side trim
       : CENTER_ANGLE[i];                    // stopped - head back to resting vertical
     target = clampf(target, ANGLE_MIN, ANGLE_MAX);   // never command past what the linkage can reach
 
@@ -512,7 +518,6 @@ int driveSpeed(int gap, int full) {
 // ---- Control Parameters ----------------------------------------------------
 #define HOMING_SPEED 220               // Speed used to drive to the Off mark
 #define FADER_MARGIN 10                // Acceptable position error, ~1% of range
-#define PRINT_INTERVAL 200             // How often to print debug values (ms)
 #define FADER_MOVE_TIMEOUT 8000              // Give up on an end rather than push into
                                        // a mechanical stop forever
 #define FADER_SAMPLES 9                      // analogRead samples averaged per reading
@@ -566,7 +571,8 @@ int handMin = 0;     // How far the hand travelled, while it was on the fader
 int handMax = 0;     // How far the hand travelled, while it was on the fader
 int idleRef = 0;     // Reading we watch for a hand while resting
 
-unsigned long faderLastPrint = 0;   // millis() timestamp of the last fader status line printed
+int lastPrintedFaderMode  = -1;   // so the fader status line only prints on a real change
+int lastPrintedFaderLevel = -1;
 unsigned long moveStart = 0;        // millis() timestamp this HOMING/SWINGING leg began, for timeouts
 unsigned long settleTime = 0;       // millis() timestamp the hand last moved, for the let-go check
 
@@ -856,10 +862,13 @@ void faderUpdate() {
   // magenta continuously. The colour only changes when you set a new faderLevel.
   showLevel(faderLevel < 0 ? 0 : faderLevel);
 
-  // Print status on an interval. Never use delay() here - the loop has to keep
-  // sampling, or it misses the movement it is supposed to detect.
-  if (millis() - faderLastPrint >= PRINT_INTERVAL) {
-    faderLastPrint = millis();
+  // Print status only when the mode or the level actually changes, not on a timer -
+  // a piece left running prints one line per real event instead of one every 200ms.
+  // The 10Hz S: telemetry below is untouched by this - the web page depends on that
+  // one arriving on a steady beat, so only this human-readable line got quieter.
+  if (faderMode != lastPrintedFaderMode || faderLevel != lastPrintedFaderLevel) {
+    lastPrintedFaderMode = faderMode;
+    lastPrintedFaderLevel = faderLevel;
 
     unsigned long ms = millis();
     Serial.print("t=");
@@ -929,6 +938,16 @@ void faderUpdate() {
     // ---- Your hand is on it: motor off, wait for you to finish ----
     case FD_GRABBED: {
       motorCoast();     // keep releasing the motor every pass while the hand is on it
+
+      // Live slider reading while you're moving it by hand - 10Hz, matches the arm
+      // telemetry rate. Read this to find SLIDER_MIN/MAX by hand instead of the k
+      // auto-calibration.
+      if (millis() - lastSliderPrint >= 100) {
+        lastSliderPrint = millis();
+        Serial.print(F("slider: "));
+        Serial.println(sliderVal);
+      }
+
       // Measure the gesture, not just where it ends: the two extremes the hand
       // reached are what the fader will ping-pong between.
       if (sliderVal < handMin) handMin = sliderVal;   // track the lowest point reached
@@ -993,9 +1012,18 @@ void faderUpdate() {
           // harder is precisely the wrong answer.
           if (boost < BOOST_MAX) {
             boost += STALL_STEP;      // try a bit more duty next pass
-          } else if (pastGrace && millis() - holdTime >= HOLD_MS) {   // at max boost and still held, for long enough
-            Serial.println("  (held still against full drive - treating as a hand)");
-            handDetected(sliderVal);
+          } else if (pastGrace && millis() - holdTime >= HOLD_MS) {   // at max boost and still stuck, for long enough
+            // This is NOT treated as a hand. A real hand is already caught reliably
+            // above, by genuine pushback against the drive direction. Stuck at max
+            // boost with no pushback is far more likely friction or a hard stop the
+            // motor can't overcome - re-capturing from here (as a hand would) risked
+            // re-levelling the fader to whatever extreme it happened to stall at,
+            // which is exactly the "drifts to HIGH after a few seconds" bug this
+            // replaced. Give up on this end and swing back instead, same as the
+            // timeout safety net above - the level you set is left alone either way.
+            Serial.println("  (stuck at max boost, no pushback - giving up on this end)");
+            motorStop();
+            swapTarget(sliderVal);
             break;
           }
         }
@@ -1074,20 +1102,23 @@ void report() {
   Serial.println();
 }
 
-// Human-readable angle for every arm that is currently swinging, e.g. "angle  D0: 108
-// D7: 76". Prints nothing when no arm is running, so an idle board stays quiet. This
-// is separate from the S: telemetry line above (which report() prints unconditionally,
-// in a compact format meant for the web page) - this one is meant to be read by eye.
-void printMovingAngles() {
-  bool printedAny = false;
+// Prints one line per arm, only at the moment it starts, stops or changes level -
+// never on a timer, so a piece left running at a steady level stays quiet instead of
+// repeating the same angle every 200ms. This is separate from the S: telemetry line
+// above (which report() prints unconditionally, in a compact format meant for the web
+// page) - this one is meant to be read by eye, e.g. "D7 -> HIGH, 101" or "D0 stopped
+// at 96".
+void printArmChanges() {
   for (uint8_t i = 0; i < ARM_COUNT; i++) {
-    if (!armRunning[i]) continue;   // only arms actually moving right now
-    if (!printedAny) { Serial.print(F("angle  ")); printedAny = true; }
-    else Serial.print(F("   "));
+    if (armRunning[i] == lastArmRunning[i] && armState[i] == lastArmState[i]) continue;   // nothing changed
     Serial.print(F("D")); Serial.print(SERVO_PIN[i]);
-    Serial.print(F(": ")); Serial.print((int)(armAngle[i] + 0.5));
+    if (armRunning[i]) { Serial.print(F(" -> ")); Serial.print(STATE_NAME[armState[i]]); Serial.print(F(", ")); }
+    else                 Serial.print(F(" stopped at "));
+    Serial.print((int)(armAngle[i] + 0.5));
+    Serial.println(F(" deg"));
+    lastArmRunning[i] = armRunning[i];
+    lastArmState[i]   = armState[i];
   }
-  if (printedAny) Serial.println();
 }
 
 // Single characters typed into the Serial Monitor. Returns true if handled.
@@ -1106,6 +1137,7 @@ bool handleKey(char c) {
     case 'c': takeControl(); holdCenter = true;                 // park every arm at CENTER_ANGLE
               for (uint8_t i = 0; i < ARM_COUNT; i++) { armRunning[i] = true; attachArm(i, true); }
               Serial.println(F("OK:key holding CENTER_ANGLE")); return true;
+    case 'k': calibrate(); return true;                         // drive to both fader stops and measure travel
     default:  return false;    // not a recognised single-character command
   }
 }
@@ -1188,6 +1220,47 @@ void handleLine(char *s) {
     servos[idx].write(ang);
     Serial.print(F("OK:C ")); Serial.print(idx);
     Serial.print(F(" holding ")); Serial.println(ang);
+    return;
+  }
+
+  // A:<arm>:<posScale>:<negScale> — trim one side of an arm's swing to match the
+  // other, live, no re-upload. e.g. A:0:1.0:0.8 pulls arm 0's negative side in by
+  // 20%. A alone prints the live table, ready to paste back into ampScalePos/Neg.
+  if (kind == 'A') {
+    if (s[1] == '\0') {
+      for (uint8_t i = 0; i < ARM_COUNT; i++) {
+        Serial.print(F("A:")); Serial.print(i);
+        Serial.print(F(" pos=")); Serial.print(ampScalePos[i], 2);
+        Serial.print(F(" neg=")); Serial.println(ampScaleNeg[i], 2);
+      }
+      return;
+    }
+    if (s[1] != ':') { Serial.println(F("ERR:use A or A:<arm>:<posScale>:<negScale>")); return; }
+
+    char *p1 = strchr(s + 2, ':');                                          // separates arm from posScale
+    if (!p1) { Serial.println(F("ERR:A needs arm, posScale and negScale")); return; }
+    *p1 = '\0';
+    char *p2 = strchr(p1 + 1, ':');                                         // separates posScale from negScale
+    if (!p2) { Serial.println(F("ERR:A needs arm, posScale and negScale")); return; }
+    *p2 = '\0';
+
+    int idx = atoi(s + 2);
+    if (idx < 0 || idx >= ARM_COUNT) { Serial.println(F("ERR:arm out of range")); return; }
+
+    float pos = atof(p1 + 1);
+    float neg = atof(p2 + 1);
+    // Clamp rather than reject: a typo should not fling an arm into its end stop.
+    if (pos < 0.2) pos = 0.2;
+    if (pos > 1.5) pos = 1.5;
+    if (neg < 0.2) neg = 0.2;
+    if (neg > 1.5) neg = 1.5;
+
+    ampScalePos[idx] = pos;
+    ampScaleNeg[idx] = neg;
+
+    Serial.print(F("OK:A ")); Serial.print(idx);
+    Serial.print(F(" pos=")); Serial.print(pos, 2);
+    Serial.print(F(" neg=")); Serial.println(neg, 2);
     return;
   }
 
@@ -1322,14 +1395,14 @@ void loop() {
     updateArms(dt);
   }
 
-  if (now - lastReport >= 100) {   // 10 Hz telemetry
-    lastReport = now;
-    report();
-    // Fader state on its own line, so the S: format stays exactly as it was.
-  }
-
-  if (now - lastArmPrint >= ARM_PRINT_MS) {   // 5 Hz human-readable angle print
-    lastArmPrint = now;
-    printMovingAngles();
-  }
+  // Servo telemetry commented out while reading the slider by hand, so its 10Hz S:
+  // line and per-arm change lines do not clutter the Serial Monitor. Uncomment both
+  // to bring arm telemetry back.
+  // if (now - lastReport >= 100) {   // 10 Hz telemetry
+  //   lastReport = now;
+  //   report();
+  //   // Fader state on its own line, so the S: format stays exactly as it was.
+  // }
+  //
+  // printArmChanges();   // change-triggered, not on a timer - see its own comment above
 }
