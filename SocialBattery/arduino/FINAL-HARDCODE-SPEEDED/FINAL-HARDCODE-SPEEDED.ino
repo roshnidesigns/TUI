@@ -112,21 +112,21 @@
 
 // ---- Servo arm (D7 only - the full sketch's second arm, D0, is not used here) ----
 #define SERVO_PIN 7
-#define ARM_CENTER_ANGLE 93   // resting vertical, measured by hand with C:<arm>:<angle> in the full sketch
-#define ARM_ANGLE_MIN 10      // hard clamp - keep inside what the linkage can physically reach
-#define ARM_ANGLE_MAX 210
+#define ARM_CENTER_ANGLE 88   // resting vertical, measured by hand with C:<arm>:<angle> in the full sketch
+#define ARM_ANGLE_MIN 20      // hard clamp - keep inside what the linkage can physically reach
+#define ARM_ANGLE_MAX 200
 
 enum ArmState { ARM_LOW = 0, ARM_MED = 1, ARM_HIGH = 2, ARM_STATE_COUNT = 3 };
 const char* ARM_STATE_NAME[ARM_STATE_COUNT] = { "LOW", "MED", "HIGH" };
 
-// Amplitude (degrees either side of centre) and rate (radians/second) per level -
-// the same numbers the two-arm full sketch uses. These are also exactly what
-// PACE_SECONDS above was worked out from: one full round trip takes 2*PI/rate
-// seconds, which comes out to 35 / 14 / 10.5s - so the arm and the slider are
-// already tuned to the same clock at each level, just not wired together yet.
+// Amplitude (degrees either side of centre) and rate (radians/second) per level.
+// Rate is set from a target period (one full round trip, 2*PI/rate seconds) to
+// match PACE_SECONDS below at each level: 30 / 10 / 6s. Amplitude is unchanged -
+// this is a speed-only change. Peak swing speed at HIGH works out to ~30 deg/s,
+// well under ARM_SLEW_DEG_PER_SEC below, so nothing here gets slew-clipped.
 //                                    LOW    MED    HIGH
-const float ARM_STATE_AMP[ARM_STATE_COUNT]  = { 10.0,  25.0,  45.0 };   // degrees either side of centre
-const float ARM_STATE_RATE[ARM_STATE_COUNT] = { 0.18,  0.45,  0.60 };   // radians/second
+const float ARM_STATE_AMP[ARM_STATE_COUNT]  = { 10.0,   25.0,   45.0 };   // degrees either side of centre - unchanged
+const float ARM_STATE_RATE[ARM_STATE_COUNT] = { 0.2094, 0.6283, 1.0472 }; // radians/second - 2*PI / (30, 10, 6)
 
 #define ARM_STATE_BLEND_SEC 1.4      // seconds to ease amplitude across a level change, so it reads as a mood change
 #define ARM_SLEW_DEG_PER_SEC 140.0   // max degrees/second on any move - keeps it reading as alive, not snapping
@@ -259,11 +259,11 @@ void updateArm(float dt) {
 #define LED_BRIGHTNESS 50    // 0-255, kept well below max so the strip is not blinding
 const uint8_t STRIP_MASK[4] = { 0b00000000, 0b00011000, 0b00111100, 0b11111111 };   // which pixels light, indexed by level
 
-// How long a full round trip (A -> B -> A) takes, in seconds, per level - taken
-// from the servo arms' measured swing timing, so the fader can later be paced in
-// step with them instead of just running at whatever speed SWING_SPEED produces.
+// How long a full round trip (A -> B -> A) takes, in seconds, per level - matches
+// ARM_STATE_RATE above at each level (2*PI/rate), so the fader and the servo arm
+// are tuned to the same clock, just not wired together yet.
 //                                Off  Low   Medium  High
-const float PACE_SECONDS[4] = {   0,  35.0,  14.0,  10.5 };
+const float PACE_SECONDS[4] = {   0,  30.0,  10.0,   6.0 };
 
 // The ceiling duty used while chasing the paced target above. The swing's ENDS
 // come from the mirror - where you left the slider, and its reflection - so the
@@ -314,8 +314,13 @@ int driveSpeed(int gap, int full) {
 // instead grows by more than this, something is pushing back - you.
 // Catching a hand while the motor is driving.
 //
-#define GRACE_MS 150        // ignore direction right after a turn
-#define REVERSE_MARGIN 12   // counts moved against the drive = a hand
+// Both widened from 150/12: the paced target reverses instantly at each turnaround,
+// but the mechanism can't - it coasts a little in the old direction first, which was
+// getting misread as a hand and releasing the motor mid-swing. Still tiny next to a
+// real grab (which moves the slider far more than this within the window) and next
+// to the shortest half-leg (HIGH's 3s), so real hand-detection should stay responsive.
+#define GRACE_MS 300        // ignore direction right after a turn
+#define REVERSE_MARGIN 20   // counts moved against the drive = a hand
 #define SETTLE_MOVE 8      // Counts of change that still count as "hand moving"
 #define SETTLE_MS 400      // Hand still this long = you let go
 

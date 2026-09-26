@@ -106,7 +106,7 @@
 #define HOLD_AT_REST 0
 #define RELEASE_AFTER_MS 900   // settle time before letting go
 
-const uint8_t SERVO_PIN[] = { 2, 3 };
+const uint8_t SERVO_PIN[] = { 0, 7 };
 //
 // Arm order follows this array: index 0 is the blue square on the longest rod at the
 // back (D5), 1 the yellow wedge in the middle (D3), 2 the red octagon at the front (D1).
